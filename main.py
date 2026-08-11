@@ -10,7 +10,7 @@ Account injection (Render/Railway env vars):
   ... (up to 10)
 
 To encode your account JSON for Render:
-  python -c "import base64,json; print(base64.b64encode(open('claude_pool/account_00/session.json','rb').read()).decode())"
+  python -c "import base64,json; print(base64.b64encode(open('claude_pool/account_0/session.json','rb').read()).decode())"
 
 Endpoints:
   GET  /                    health check
@@ -33,6 +33,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Dict, List, Optional, Generator
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -67,17 +68,21 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
     return accounts
 
 
-def _write_accounts_to_disk(accounts: list[tuple[str, dict]]) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="claude_accounts_")
+def _write_accounts_to_disk(accounts: list[tuple[str, dict]]) -> Path:
+    """Write accounts to temp dir in the structure claude_client expects:
+       /tmp/claude_accounts_xxx/account_01/session.json
+    """
+    tmpdir = Path(tempfile.mkdtemp(prefix="claude_accounts_"))
     for label, data in accounts:
-        path = os.path.join(tmpdir, f"{label}.json")
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"[startup] ✓ Wrote {label}.json → {tmpdir}")
+        slot_dir = tmpdir / label
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        path = slot_dir / "session.json"
+        path.write_text(json.dumps(data, indent=2))
+        print(f"[startup] ✓ Wrote {label}/session.json → {tmpdir}")
     return tmpdir
 
 
-# ─── Patch claude_client paths before importing ──────────────────────────────
+# ─── Patch claude_client paths BEFORE importing ──────────────────────────────
 
 _accounts_from_env = _load_accounts_from_env()
 
@@ -156,7 +161,9 @@ def _init_provider():
             raise RuntimeError("No accounts found in pool directory.")
 
         for label in _accounts:
-            data = load_slot_session(label) or ensure_slot(label, None)
+            data = load_slot_session(label)
+            if data is None:
+                raise RuntimeError(f"No session.json found for {label}")
             _account_objects.append(_ClaudeAccount(label, data))
             _slot_states[label] = _SlotState(label, data, None)
             print(f"[startup]   Loaded: {label}")
@@ -230,7 +237,9 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
         label = acc.label
         try:
             if label not in _slot_states:
-                data = ensure_slot(label, None)
+                data = load_slot_session(label)
+                if data is None:
+                    raise RuntimeError(f"{label} session missing")
                 _slot_states[label] = _SlotState(label, data, None)
 
             state = _slot_states[label]
@@ -453,7 +462,9 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
     label = acc.label
     try:
         if label not in _slot_states:
-            data = ensure_slot(label, None)
+            data = load_slot_session(label)
+            if data is None:
+                raise RuntimeError(f"{label} session missing")
             _slot_states[label] = _SlotState(label, data, None)
 
         state = _slot_states[label]
