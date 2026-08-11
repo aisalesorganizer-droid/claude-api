@@ -325,7 +325,7 @@ def _make_curl_session(cookies: dict, proxy: Optional[str]) -> curl_requests.Ses
     if not CURL_AVAILABLE:
         raise RuntimeError("curl_cffi not installed. Run: pip install curl_cffi")
     s = curl_requests.Session(
-        impersonate="chrome124",
+        impersonate="chrome131",
         proxies={"https": proxy, "http": proxy} if proxy else {},
     )
     for name, value in cookies.items():
