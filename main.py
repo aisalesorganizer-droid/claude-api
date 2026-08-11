@@ -42,6 +42,10 @@ from pydantic import BaseModel
 
 # ─── Account loading from env ─────────────────────────────────────────────────
 
+# Cloudflare cookies that are IP-bound — strip them on server to test
+# if curl_cffi impersonation alone is enough
+_CF_COOKIES = {"cf_clearance", "__cf_bm"}
+
 def _load_accounts_from_env() -> list[tuple[str, dict]]:
     accounts = []
     for i in range(1, 11):
@@ -50,8 +54,15 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
         if val:
             try:
                 data = json.loads(base64.b64decode(val))
+                # STRIP IP-bound Cloudflare cookies for server deployment
+                cookies = data.get("cookies", {})
+                stripped = {k: v for k, v in cookies.items() if k not in _CF_COOKIES}
+                removed = set(cookies.keys()) - set(stripped.keys())
+                if removed:
+                    print(f"[startup] {key}: stripped IP-bound cookies: {removed}")
+                data["cookies"] = stripped
                 accounts.append((f"account_{i:02d}", data))
-                print(f"[startup] ✓ Loaded {key}")
+                print(f"[startup] ✓ Loaded {key} (cookies: {list(stripped.keys())})")
             except Exception as e:
                 print(f"[startup] ✗ Failed to decode {key}: {e}")
 
@@ -60,8 +71,14 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
         if val:
             try:
                 data = json.loads(base64.b64decode(val))
+                cookies = data.get("cookies", {})
+                stripped = {k: v for k, v in cookies.items() if k not in _CF_COOKIES}
+                removed = set(cookies.keys()) - set(stripped.keys())
+                if removed:
+                    print(f"[startup] CLAUDE_ACCOUNT: stripped IP-bound cookies: {removed}")
+                data["cookies"] = stripped
                 accounts.append(("default", data))
-                print("[startup] ✓ Loaded CLAUDE_ACCOUNT")
+                print(f"[startup] ✓ Loaded CLAUDE_ACCOUNT (cookies: {list(stripped.keys())})")
             except Exception as e:
                 print(f"[startup] ✗ Failed to decode CLAUDE_ACCOUNT: {e}")
 
