@@ -6,11 +6,11 @@ OpenAI-compatible API endpoint for Claude.ai web client.
 Account injection (Render/Railway env vars):
   CLAUDE_ACCOUNT      — single account JSON, base64-encoded
   CLAUDE_ACCOUNT_01   — pool account 1, base64-encoded
-  CLAUDE_ACCOUNT_02   — pool account 2, base64-encoded
   ... (up to 10)
 
-To encode your account JSON for Render:
-  python -c "import base64,json; print(base64.b64encode(open('claude_pool/account_0/session.json','rb').read()).decode())"
+Env:
+  CLAUDE_API_KEY      — Bearer token required for all mutation endpoints
+  CLAUDE_ALLOW_BROWSER_LOGIN — set "1" locally; server should omit this
 
 Endpoints:
   GET  /                    health check
@@ -36,14 +36,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Generator
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ─── Account loading from env ─────────────────────────────────────────────────
 
-# Cloudflare cookies that are IP-bound — strip them on server to test
-# if curl_cffi impersonation alone is enough
 _CF_COOKIES = {"cf_clearance", "__cf_bm"}
 
 def _load_accounts_from_env() -> list[tuple[str, dict]]:
@@ -54,7 +52,6 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
         if val:
             try:
                 data = json.loads(base64.b64decode(val))
-                # STRIP IP-bound Cloudflare cookies for server deployment
                 cookies = data.get("cookies", {})
                 stripped = {k: v for k, v in cookies.items() if k not in _CF_COOKIES}
                 removed = set(cookies.keys()) - set(stripped.keys())
@@ -86,9 +83,6 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
 
 
 def _write_accounts_to_disk(accounts: list[tuple[str, dict]]) -> Path:
-    """Write accounts to temp dir in the structure claude_client expects:
-       /tmp/claude_accounts_xxx/account_01/session.json
-    """
     tmpdir = Path(tempfile.mkdtemp(prefix="claude_accounts_"))
     for label, data in accounts:
         slot_dir = tmpdir / label
@@ -98,8 +92,6 @@ def _write_accounts_to_disk(accounts: list[tuple[str, dict]]) -> Path:
         print(f"[startup] ✓ Wrote {label}/session.json → {tmpdir}")
     return tmpdir
 
-
-# ─── Patch claude_client paths BEFORE importing ──────────────────────────────
 
 _accounts_from_env = _load_accounts_from_env()
 
@@ -122,43 +114,30 @@ from claude_client import (
 # ─── Supported models ─────────────────────────────────────────────────────────
 
 SUPPORTED_MODELS = [
-    # ── Haiku 4.5 — mode-only, no effort field ───────────────────────────────
     "claude-haiku-4-5",
     "claude-haiku-4-5 (Extended)",
-
-    # ── Sonnet 4.6 — no thinking: low → medium → high → max ─────────────────
     "claude-sonnet-4-6 Low",
     "claude-sonnet-4-6 Medium",
     "claude-sonnet-4-6 High",
     "claude-sonnet-4-6 Max",
-    # ── Sonnet 4.6 — thinking on: low → medium → high → max ──────────────────
     "claude-sonnet-4-6 Low + Think",
     "claude-sonnet-4-6 Medium + Think",
     "claude-sonnet-4-6 High + Think",
     "claude-sonnet-4-6 Max + Think",
-
-    # ── Sonnet 5 — no thinking: low → medium → high → xhigh → max ───────────
     "claude-sonnet-5 Low",
     "claude-sonnet-5 Medium",
     "claude-sonnet-5 High",
     "claude-sonnet-5 XHigh",
     "claude-sonnet-5 Max",
-    # ── Sonnet 5 — thinking on: low → medium → high → xhigh → max ───────────
     "claude-sonnet-5 Low + Think",
     "claude-sonnet-5 Medium + Think",
     "claude-sonnet-5 High + Think",
     "claude-sonnet-5 XHigh + Think",
     "claude-sonnet-5 Max + Think",
-
-    # ── Opus 4.6 / 4.7 / 4.8 ────────────────────────────────────────────────
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
-
-    # ── Opus 5 ───────────────────────────────────────────────────────────────
     "claude-opus-5",
-
-    # ── Fable 5 (may 403 on free accounts) ───────────────────────────────────
     "claude-fable-5",
 ]
 
@@ -167,9 +146,15 @@ SUPPORTED_MODELS = [
 _provider_ready = False
 _init_error: str | None = None
 _accounts: list[str] = []
-_slot_states: dict[str, _SlotState] = {}
 _index_lock = threading.Lock()
 _current_index = 0
+
+# FIX: Track which account uploaded which file so chat can route to the same org.
+_file_account_map: dict[str, str] = {}
+_file_map_lock = threading.Lock()
+
+# FIX: API key gate — set CLAUDE_API_KEY on Railway/Render
+API_KEY = os.environ.get("CLAUDE_API_KEY", "").strip()
 
 
 # ─── Account wrapper ──────────────────────────────────────────────────────────
@@ -187,7 +172,7 @@ class _ClaudeAccount:
     def is_healthy(self) -> bool:
         with self._lock:
             if self._fail_count >= 3:
-                if time.time() - self._last_fail < 300:  # 5 min bench
+                if time.time() - self._last_fail < 300:
                     return False
                 self._fail_count = 0
             return True
@@ -209,7 +194,7 @@ _account_objects: list[_ClaudeAccount] = []
 
 
 def _init_provider():
-    global _provider_ready, _init_error, _accounts, _account_objects, _slot_states
+    global _provider_ready, _init_error, _accounts, _account_objects
     try:
         print("[startup] Initializing Claude provider ...")
         _accounts = list_accounts()
@@ -221,7 +206,6 @@ def _init_provider():
             if data is None:
                 raise RuntimeError(f"No session.json found for {label}")
             _account_objects.append(_ClaudeAccount(label, data))
-            _slot_states[label] = _SlotState(label, data, None)
             print(f"[startup]   Loaded: {label}")
 
         _provider_ready = True
@@ -242,7 +226,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="claude-api", lifespan=lifespan)
 
 
-# ─── Guard ────────────────────────────────────────────────────────────────────
+# ─── Auth guard ───────────────────────────────────────────────────────────────
+
+async def require_auth(request: Request):
+    """Bearer-token gate. Skipped if CLAUDE_API_KEY is not set."""
+    if not API_KEY:
+        return
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 
 def _guard():
     if _init_error:
@@ -265,55 +258,71 @@ def _next_healthy_account() -> Optional[_ClaudeAccount]:
     return None
 
 
-def _consume_stream(prompt: str, model: str, file_attachments: Optional[List[dict]] = None,
-                    timeout: int = 120) -> str:
-    """Non-streaming: collect all chunks into a single string."""
-    chunks: list[str] = []
-    deadline = time.time() + timeout
-
-    for chunk in _stream_claude(prompt, model, file_attachments):
-        if time.time() > deadline:
-            raise RuntimeError(f"Claude response timed out after {timeout}s")
-        chunks.append(chunk)
-
-    return "".join(chunks)
+# FIX: Create a fresh _SlotState per request to prevent concurrent-request corruption.
+def _fresh_slot_state(label: str) -> _SlotState:
+    data = load_slot_session(label)
+    if data is None:
+        raise RuntimeError(f"{label} session missing")
+    return _SlotState(label, data, None)
 
 
-def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict]] = None) -> Generator[str, None, None]:
-    """Yield text chunks, rotating through healthy accounts."""
+def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict]] = None,
+                   forced_label: Optional[str] = None) -> Generator[str, None, None]:
+    """Yield text chunks, rotating through healthy accounts.
+
+    If forced_label is provided, that account is tried first (for file-attachment consistency).
+    """
     n = len(_account_objects)
     if n == 0:
         raise RuntimeError("No accounts available")
 
+    tried: set[str] = set()
+
+    # 1. Try forced account first (e.g. the one that uploaded the file)
+    if forced_label:
+        acc = next((a for a in _account_objects if a.label == forced_label), None)
+        if acc and acc.is_healthy and acc.label not in tried:
+            tried.add(acc.label)
+            try:
+                state = _fresh_slot_state(acc.label)
+                for chunk in _stream_on_slot(state, prompt, model, file_attachments):
+                    yield chunk
+                acc.mark_success()
+                return
+            except RuntimeError as e:
+                err_msg = str(e)
+                print(f"[stream] {acc.label} failed: {err_msg}", flush=True)
+                acc.mark_failure()
+                if "401" in err_msg or "expired" in err_msg.lower():
+                    pass
+                elif "429" in err_msg:
+                    time.sleep(2)
+                elif "overloaded" in err_msg.lower() or "temporarily" in err_msg.lower():
+                    time.sleep(3)
+                elif "403" in err_msg:
+                    time.sleep(2)
+                else:
+                    raise
+
+    # 2. Normal rotation for remaining healthy accounts
     for _ in range(n):
         acc = _next_healthy_account()
         if acc is None:
-            raise RuntimeError("All Claude accounts are exhausted. Wait 5 minutes or re-run --add-account locally.")
-
-        label = acc.label
+            break
+        if acc.label in tried:
+            continue
+        tried.add(acc.label)
         try:
-            if label not in _slot_states:
-                data = load_slot_session(label)
-                if data is None:
-                    raise RuntimeError(f"{label} session missing")
-                _slot_states[label] = _SlotState(label, data, None)
-
-            state = _slot_states[label]
-            state.conv_id = None
-            state.last_asst_uuid = None
+            state = _fresh_slot_state(acc.label)
             for chunk in _stream_on_slot(state, prompt, model, file_attachments):
                 yield chunk
-
             acc.mark_success()
             return
-
         except RuntimeError as e:
             err_msg = str(e)
-            print(f"[stream] {label} failed: {err_msg}", flush=True)
+            print(f"[stream] {acc.label} failed: {err_msg}", flush=True)
             acc.mark_failure()
-
             if "401" in err_msg or "expired" in err_msg.lower():
-                _slot_states.pop(label, None)
                 continue
             if "429" in err_msg:
                 time.sleep(2)
@@ -327,6 +336,18 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
             raise
 
     raise RuntimeError("All Claude accounts failed after full rotation.")
+
+
+def _consume_stream(prompt: str, model: str, file_attachments: Optional[List[dict]] = None,
+                    forced_label: Optional[str] = None, timeout: int = 120) -> str:
+    """Non-streaming: collect all chunks into a single string."""
+    chunks: list[str] = []
+    deadline = time.time() + timeout
+    for chunk in _stream_claude(prompt, model, file_attachments, forced_label):
+        if time.time() > deadline:
+            raise RuntimeError(f"Claude response timed out after {timeout}s")
+        chunks.append(chunk)
+    return "".join(chunks)
 
 
 def _to_openai_stream(claude_chunks: Generator[str, None, None], model: str) -> Generator[str, None, None]:
@@ -478,7 +499,7 @@ def list_models():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, _=Depends(require_auth)):
     _guard()
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
@@ -506,7 +527,7 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/v1/files/upload", response_model=FileUploadResponse)
-async def upload_file_endpoint(file: UploadFile = File(...)):
+async def upload_file_endpoint(file: UploadFile = File(...), _=Depends(require_auth)):
     """
     Upload a file to Claude. Returns file metadata for use in chat attachments.
     Pass the file UUID via X-Claude-File-Ids header on /v1/chat/completions.
@@ -525,13 +546,7 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 
     label = acc.label
     try:
-        if label not in _slot_states:
-            data = load_slot_session(label)
-            if data is None:
-                raise RuntimeError(f"{label} session missing")
-            _slot_states[label] = _SlotState(label, data, None)
-
-        state = _slot_states[label]
+        state = _fresh_slot_state(label)
         s = state.http
 
         loop = asyncio.get_event_loop()
@@ -541,7 +556,12 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
         )
 
         file_uuid = result.get("uuid") or result.get("file_uuid") or result.get("id", "")
-        print(f"[upload] ✓ {filename} → {file_uuid}")
+
+        # FIX: Remember which account owns this file so chat routes to the same org.
+        with _file_map_lock:
+            _file_account_map[file_uuid] = label
+
+        print(f"[upload] ✓ {filename} → {file_uuid} (account={label})")
         return FileUploadResponse(
             file_id=file_uuid,
             filename=filename,
@@ -558,7 +578,7 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 
 
 @app.post("/v1/chat/completions")
-async def oai_chat(request: Request):
+async def oai_chat(request: Request, _=Depends(require_auth)):
     body = await request.json()
     print(f"[oai] RAW BODY: {json.dumps(body)[:200]}")
 
@@ -587,8 +607,6 @@ async def oai_chat(request: Request):
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
     # ── Prompt assembly: Claude web API format ────────────────────────────────
-    # The completion endpoint has a single `prompt` field — no native system param.
-    # Correct format: <system> block first, then Human:/Assistant: turn pairs.
     parts = []
 
     # 1. Extract system message (if any) → wrap in <system> XML tag
@@ -607,8 +625,11 @@ async def oai_chat(request: Request):
         elif m["role"] == "assistant":
             parts.append(f"\n\nAssistant: {m['content']}")
 
-    # 3. Trailing Assistant: marker so Claude knows it's its turn to respond
-    parts.append("\n\nAssistant:")
+    # FIX: Only append trailing Assistant: marker if the last non-system message
+    # is from the user. If it ends with assistant, we want continuation, not a new turn.
+    last_non_system = next((m for m in reversed(messages) if m["role"] != "system"), None)
+    if last_non_system is None or last_non_system["role"] == "user":
+        parts.append("\n\nAssistant:")
 
     prompt = "".join(parts)
 
@@ -616,6 +637,19 @@ async def oai_chat(request: Request):
         (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
     )
     print(f"[oai] model={model} prompt={last_user[:80]}")
+
+    # FIX: If file attachments exist, determine which account uploaded them
+    # and force the chat to use that account (files are org-scoped).
+    forced_label = None
+    if file_attachments:
+        for fa in file_attachments:
+            fid = fa.get("file_uuid", "")
+            with _file_map_lock:
+                fl = _file_account_map.get(fid)
+            if fl:
+                forced_label = fl
+                print(f"[oai] Forcing account {forced_label} for file {fid}")
+                break
 
     if req.stream:
         def stream_generator():
@@ -627,7 +661,7 @@ async def oai_chat(request: Request):
 
             def _run_in_thread():
                 try:
-                    for chunk in _to_openai_stream(_stream_claude(prompt, model, file_attachments), model):
+                    for chunk in _to_openai_stream(_stream_claude(prompt, model, file_attachments, forced_label), model):
                         q.put(chunk)
                 except Exception as e:
                     error_holder[0] = e
@@ -667,7 +701,7 @@ async def oai_chat(request: Request):
         loop = asyncio.get_event_loop()
         answer = await loop.run_in_executor(
             None,
-            lambda: _consume_stream(prompt, model, file_attachments),
+            lambda: _consume_stream(prompt, model, file_attachments, forced_label),
         )
 
         prompt_tokens = sum(len(m["content"].split()) for m in messages)

@@ -21,6 +21,7 @@ Env:
   CLAUDE_PROXY       socks5://... or "none"  (auto-detects WARP on 40000)
   CLAUDE_SSE_DEBUG   1 = raw SSE frames to stderr
   CLAUDE_POOL_DIR    pool directory (default: ./claude_pool)
+  CLAUDE_ALLOW_BROWSER_LOGIN  set to "1" to allow Playwright login (default: 1)
 """
 
 from __future__ import annotations
@@ -53,17 +54,11 @@ SSE_DEBUG = os.environ.get("CLAUDE_SSE_DEBUG", "0") == "1"
 POOL_DIR  = Path(os.environ.get("CLAUDE_POOL_DIR", "claude_pool"))
 
 # ─── Model configuration (source: HAR analysis 2026-08-12) ────────────────────
-# thinking_mode : "off" | "auto" | "extended"
-# effort        : "low" | "medium" | "high" | "xhigh" | "max" | None
-#                 None  → field must be OMITTED (Haiku uses mode-only, no effort)
 MODEL_CONFIGS: dict = {
-    # ── Haiku 4.5 — mode-only (no effort field) ──────────────────────────────
     "claude-haiku-4-5":             {"model": "claude-haiku-4-5-20251001", "thinking_mode": "off",      "effort": None},
     "claude-haiku-4-5 (Extended)":  {"model": "claude-haiku-4-5-20251001", "thinking_mode": "extended", "effort": None},
-    # canonical key (internal, not in display list)
     "claude-haiku-4-5-20251001":    {"model": "claude-haiku-4-5-20251001", "thinking_mode": "off",      "effort": None},
 
-    # ── Sonnet 4.6 — effort_and_mode, 4 levels, no xhigh ────────────────────
     "claude-sonnet-4-6 Low":              {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "low"},
     "claude-sonnet-4-6 Medium":           {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "medium"},
     "claude-sonnet-4-6 High":             {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "high"},
@@ -72,10 +67,8 @@ MODEL_CONFIGS: dict = {
     "claude-sonnet-4-6 Medium + Think":   {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "medium"},
     "claude-sonnet-4-6 High + Think":     {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "high"},
     "claude-sonnet-4-6 Max + Think":      {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "max"},
-    # canonical key (default: high, no thinking)
     "claude-sonnet-4-6":                  {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "high"},
 
-    # ── Sonnet 5 — effort_and_mode, 5 levels (adds xhigh) ───────────────────
     "claude-sonnet-5 Low":                {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "low"},
     "claude-sonnet-5 Medium":             {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "medium"},
     "claude-sonnet-5 High":               {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "high"},
@@ -86,15 +79,12 @@ MODEL_CONFIGS: dict = {
     "claude-sonnet-5 High + Think":       {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "high"},
     "claude-sonnet-5 XHigh + Think":      {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "xhigh"},
     "claude-sonnet-5 Max + Think":        {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "max"},
-    # canonical key (default: medium, no thinking)
     "claude-sonnet-5":                    {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "medium"},
 
-    # ── Opus models ───────────────────────────────────────────────────────────
     "claude-opus-4-6":  {"model": "claude-opus-4-6", "thinking_mode": "extended", "effort": "medium"},
     "claude-opus-4-7":  {"model": "claude-opus-4-7", "thinking_mode": "auto",     "effort": "xhigh"},
     "claude-opus-4-8":  {"model": "claude-opus-4-8", "thinking_mode": "auto",     "effort": "high"},
 
-    # ── Frontier (in selector; may 403 on free accounts) ──────────────────────
     "claude-fable-5":   {"model": "claude-fable-5", "thinking_mode": "auto", "effort": "high"},
     "claude-opus-5":    {"model": "claude-opus-5",  "thinking_mode": "auto", "effort": "high"},
 }
@@ -102,11 +92,6 @@ _DEFAULT_MODEL_CONFIG: dict = {"model": "claude-sonnet-4-6", "thinking_mode": "o
 
 
 def resolve_model(display_name: str) -> tuple:
-    """
-    Given a display name (e.g. 'claude-sonnet-4-6 High + Think'),
-    return (real_model_string, thinking_mode, effort).
-    effort may be None for Haiku. Falls back to default if unknown.
-    """
     cfg = MODEL_CONFIGS.get(display_name, _DEFAULT_MODEL_CONFIG)
     return cfg["model"], cfg["thinking_mode"], cfg["effort"]
 
@@ -126,8 +111,6 @@ _WANTED_COOKIES = {
 }
 
 
-# ─── UUID v7 ─────────────────────────────────────────────────────────────────
-
 def uuid7() -> str:
     ts = int(time.time() * 1000)
     b  = ts.to_bytes(6, "big") + os.urandom(10)
@@ -137,8 +120,6 @@ def uuid7() -> str:
     h = ba.hex()
     return "{}-{}-{}-{}-{}".format(h[:8], h[8:12], h[12:16], h[16:20], h[20:])
 
-
-# ─── Proxy ─────────────────────────────────────────────────────────────────────
 
 def detect_proxy() -> Optional[str]:
     if PROXY_ENV.lower() == "none":
@@ -154,8 +135,6 @@ def detect_proxy() -> Optional[str]:
     return None
 
 
-# ─── Pool management ───────────────────────────────────────────────────────────
-
 def list_accounts(pool_dir: Optional[Path] = None) -> list:
     pd = pool_dir or POOL_DIR
     if not pd.exists():
@@ -164,7 +143,16 @@ def list_accounts(pool_dir: Optional[Path] = None) -> list:
                   if d.is_dir() and d.name.startswith("account_"))
 
 def next_slot_name(pool_dir: Optional[Path] = None) -> str:
-    return "account_{}".format(len(list_accounts(pool_dir)))
+    existing = set()
+    for name in list_accounts(pool_dir):
+        try:
+            existing.add(int(name.split("_")[1]))
+        except (IndexError, ValueError):
+            pass
+    i = 1
+    while i in existing:
+        i += 1
+    return "account_{}".format(i)
 
 def session_file(slot: str, pool_dir: Optional[Path] = None) -> Path:
     return (pool_dir or POOL_DIR) / slot / "session.json"
@@ -172,8 +160,6 @@ def session_file(slot: str, pool_dir: Optional[Path] = None) -> Path:
 def profile_dir(slot: str, pool_dir: Optional[Path] = None) -> Path:
     return (pool_dir or POOL_DIR) / slot / "chrome_profile"
 
-
-# ─── Rotation ──────────────────────────────────────────────────────────────────
 
 def get_rotation_index(pool_dir: Optional[Path] = None) -> int:
     rf = (pool_dir or POOL_DIR) / "rotation.json"
@@ -189,8 +175,6 @@ def advance_rotation(current_idx: int, pool_dir: Optional[Path] = None):
     pd.mkdir(exist_ok=True)
     ((pd / "rotation.json")).write_text(json.dumps({"index": current_idx + 1}))
 
-
-# ─── Session cache ─────────────────────────────────────────────────────────────
 
 def load_slot_session(slot: str, pool_dir: Optional[Path] = None) -> Optional[dict]:
     sf = session_file(slot, pool_dir)
@@ -233,8 +217,6 @@ def clear_slot_session(slot: str, pool_dir: Optional[Path] = None):
     session_file(slot, pool_dir).unlink(missing_ok=True)
     print("[{}] Session cleared".format(slot), file=sys.stderr)
 
-
-# ─── Playwright login ──────────────────────────────────────────────────────────
 
 def playwright_login(slot: str, proxy: Optional[str], pool_dir: Optional[Path] = None) -> dict:
     if not PLAYWRIGHT_AVAILABLE:
@@ -345,7 +327,7 @@ def playwright_login(slot: str, proxy: Optional[str], pool_dir: Optional[Path] =
         anonymous_id = ""
         try:
             anonymous_id = page.evaluate(
-                "() => { try { return (localStorage.getItem('ajs_anonymous_id') || '').replace(/^\"|\"$/g, ''); } catch(e) { return ''; } }"
+                "() => { try { return (localStorage.getItem('ajs_anonymous_id') || '').replace(/^\\\"|\\\"$/g, ''); } catch(e) { return ''; } }"
             ) or ""
         except Exception:
             pass
@@ -376,8 +358,6 @@ def playwright_login(slot: str, proxy: Optional[str], pool_dir: Optional[Path] =
         "expires":      expires_iso,
     }
 
-
-# ─── curl_cffi session builder ─────────────────────────────────────────────────
 
 def _make_curl_session(cookies: dict, proxy: Optional[str]) -> curl_requests.Session:
     if not CURL_AVAILABLE:
@@ -412,9 +392,12 @@ def _make_curl_session(cookies: dict, proxy: Optional[str]) -> curl_requests.Ses
     return s
 
 
-# ─── Ensure slot has a valid session ──────────────────────────────────────────
-
 def ensure_slot(slot: str, proxy: Optional[str], pool_dir: Optional[Path] = None) -> dict:
+    # FIX: Guard against accidental Playwright launch on server (e.g. Railway)
+    if os.environ.get("CLAUDE_ALLOW_BROWSER_LOGIN", "1") != "1":
+        raise RuntimeError(
+            "Browser login disabled on server. Set CLAUDE_ALLOW_BROWSER_LOGIN=1 to enable."
+        )
     cached = load_slot_session(slot, pool_dir)
     if cached:
         return cached
@@ -423,8 +406,6 @@ def ensure_slot(slot: str, proxy: Optional[str], pool_dir: Optional[Path] = None
                       sess["anonymous_id"], sess["expires"], pool_dir)
     return sess
 
-
-# ─── Conversation API ──────────────────────────────────────────────────────────
 
 def create_conversation(s: curl_requests.Session, org_id: str, device_id: str, model: str = MODEL) -> str:
     conv_id = str(_uuid.uuid4())
@@ -446,28 +427,19 @@ def create_conversation(s: curl_requests.Session, org_id: str, device_id: str, m
     return conv_id
 
 
-# ─── File Upload ───────────────────────────────────────────────────────────────
-
 def upload_file(s: curl_requests.Session, org_id: str, file_bytes: bytes, filename: str,
                 mime_type: str = "application/octet-stream") -> dict:
     """Upload a file to Claude and return attachment metadata."""
     url = BASE_URL + "/api/organizations/{}/upload".format(org_id)
-
-    # Claude web uses multipart/form-data
     files = {"file": (filename, file_bytes, mime_type)}
-
     r = s.post(url, files=files, timeout=60)
     print("[upload] HTTP {}".format(r.status_code), file=sys.stderr)
-
     if r.status_code not in (200, 201):
         raise RuntimeError("upload_file: {} {}".format(r.status_code, r.text[:300]))
-
     data = r.json()
     print("[upload] file_id={}".format(data.get("uuid", data.get("file_uuid", "?"))), file=sys.stderr)
     return data
 
-
-# ─── Slot State ────────────────────────────────────────────────────────────────
 
 class _SlotState:
     """Holds live state for one account slot across turns."""
@@ -524,7 +496,7 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
             "assistant_message_uuid": asst_uuid,
         },
     }
-    if effort is not None:          # Haiku: omit effort field; all others: include
+    if effort is not None:
         body["effort"] = effort
     if state.last_asst_uuid:
         body["parent_message_uuid"] = state.last_asst_uuid
@@ -559,8 +531,8 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
         raise RuntimeError("[{}] HTTP {} {}".format(slot, r.status_code, r.text[:300]))
 
     chunks = []
-    got_content = False   # True once any text_delta is received
-    got_thinking = False  # True once any thinking_delta is received
+    got_content = False
+    got_thinking = False
 
     for raw in r.iter_lines():
         line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
@@ -590,17 +562,20 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
                     got_content = True
                     yield chunk
             elif dtype == "thinking_delta":
-                # thinking tokens: track but do not yield to caller
                 got_thinking = True
 
         elif etype == "message_stop":
-            # Valid stop conditions:
-            # 1. got text content (normal)
-            # 2. got only thinking but no text (model thought but said nothing — treat as empty, not error)
+            # FIX: If model thought but produced no text, reset conversation state
+            # to avoid poisoning the parent_message_uuid chain with an empty turn.
             if not got_content and not got_thinking:
                 state.conv_id        = None
                 state.last_asst_uuid = None
                 raise RuntimeError("[{}] message_stop with no content — session may be expired".format(slot))
+            if not got_content and got_thinking:
+                # Thinking-only response: reset state so next turn starts fresh
+                state.conv_id        = None
+                state.last_asst_uuid = None
+                return
             state.last_asst_uuid = asst_uuid
             return
 
@@ -621,8 +596,6 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     state.last_asst_uuid = None
     raise RuntimeError("[{}] SSE stream closed with no content".format(slot))
 
-
-# ─── Rotating send ─────────────────────────────────────────────────────────────
 
 def send(prompt: str, proxy: Optional[str] = None, model: str = MODEL,
          file_attachments: Optional[List[dict]] = None) -> str:
@@ -662,6 +635,42 @@ def _stream(prompt: str, proxy: Optional[str] = None, model: str = MODEL,
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
 
+def _next_env_index(env_path: Path) -> int:
+    """Scan .env for existing CLAUDE_ACCOUNT_XX entries and return the next index (1-based)."""
+    highest = 0
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("CLAUDE_ACCOUNT_"):
+                try:
+                    num = int(line.split("_")[2].split("=")[0])
+                    if num > highest:
+                        highest = num
+                except (IndexError, ValueError):
+                    pass
+    return highest + 1
+
+
+def _append_env(slot: str, sess: dict, env_path: Path):
+    """Base64-encode session JSON and append to .env as CLAUDE_ACCOUNT_XX."""
+    raw     = json.dumps(sess, ensure_ascii=False)
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    idx     = _next_env_index(env_path)
+    key     = "CLAUDE_ACCOUNT_{:02d}".format(idx)
+
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    needs_header = "CLAUDE_ACCOUNT_" not in existing
+
+    with env_path.open("a", encoding="utf-8") as f:
+        if needs_header:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("\n# ── Account Pool ──────────────────────────────────────────\n")
+        f.write("\n{}={}\n".format(key, encoded))
+
+    print("\n[env] {} → {}\n      {}...".format(key, env_path, encoded[:60]))
+
+
 def cmd_add_account(proxy: Optional[str]):
     slot = next_slot_name()
     print("\nAdding slot: {}".format(slot))
@@ -669,6 +678,7 @@ def cmd_add_account(proxy: Optional[str]):
     sess = playwright_login(slot, proxy)
     save_slot_session(slot, sess["cookies"], sess["org_id"], sess["device_id"],
                       sess["anonymous_id"], sess["expires"])
+    _append_env(slot, sess, Path(".env"))
     accounts = list_accounts()
     print("\n[pool] {} added. Pool size: {}".format(slot, len(accounts)))
 
