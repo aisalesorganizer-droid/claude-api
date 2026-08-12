@@ -42,9 +42,10 @@ from pydantic import BaseModel
 
 # ─── Account loading from env ─────────────────────────────────────────────────
 
-_CF_COOKIES = {"cf_clearance", "__cf_bm"}
-
 def _load_accounts_from_env() -> list[tuple[str, dict]]:
+    """Load accounts from env vars. Keep ALL cookies including cf_clearance.
+    Cloudflare cookies are IP-bound but without them datacenter IPs get 403.
+    """
     accounts = []
     for i in range(1, 11):
         key = f"CLAUDE_ACCOUNT_{i:02d}"
@@ -53,13 +54,8 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
             try:
                 data = json.loads(base64.b64decode(val))
                 cookies = data.get("cookies", {})
-                stripped = {k: v for k, v in cookies.items() if k not in _CF_COOKIES}
-                removed = set(cookies.keys()) - set(stripped.keys())
-                if removed:
-                    print(f"[startup] {key}: stripped IP-bound cookies: {removed}")
-                data["cookies"] = stripped
                 accounts.append((f"account_{i:02d}", data))
-                print(f"[startup] ✓ Loaded {key} (cookies: {list(stripped.keys())})")
+                print(f"[startup] ✓ Loaded {key} (cookies: {list(cookies.keys())})")
             except Exception as e:
                 print(f"[startup] ✗ Failed to decode {key}: {e}")
 
@@ -69,13 +65,8 @@ def _load_accounts_from_env() -> list[tuple[str, dict]]:
             try:
                 data = json.loads(base64.b64decode(val))
                 cookies = data.get("cookies", {})
-                stripped = {k: v for k, v in cookies.items() if k not in _CF_COOKIES}
-                removed = set(cookies.keys()) - set(stripped.keys())
-                if removed:
-                    print(f"[startup] CLAUDE_ACCOUNT: stripped IP-bound cookies: {removed}")
-                data["cookies"] = stripped
                 accounts.append(("default", data))
-                print(f"[startup] ✓ Loaded CLAUDE_ACCOUNT (cookies: {list(stripped.keys())})")
+                print(f"[startup] ✓ Loaded CLAUDE_ACCOUNT (cookies: {list(cookies.keys())})")
             except Exception as e:
                 print(f"[startup] ✗ Failed to decode CLAUDE_ACCOUNT: {e}")
 
@@ -205,11 +196,36 @@ def _init_provider():
             data = load_slot_session(label)
             if data is None:
                 raise RuntimeError(f"No session.json found for {label}")
+
+            # Pre-flight: test if session can hit Claude without Cloudflare 403
+            s = _make_curl_session(data.get("cookies", {}), None)
+            try:
+                r = s.get(BASE_URL + "/api/organizations", timeout=15)
+                if r.status_code == 403 and "Just a moment" in r.text:
+                    print(f"[startup] ⚠ {label}: Cloudflare challenge (403) — session likely IP-bound.")
+                    # Still load it; may work if IP is close, but mark as unhealthy
+                    acc = _ClaudeAccount(label, data)
+                    acc.mark_failure()
+                    _account_objects.append(acc)
+                    continue
+                elif r.status_code != 200:
+                    print(f"[startup] ⚠ {label}: org lookup returned HTTP {r.status_code}")
+            except Exception as e:
+                print(f"[startup] ⚠ {label}: pre-flight check failed: {e}")
+
             _account_objects.append(_ClaudeAccount(label, data))
             print(f"[startup]   Loaded: {label}")
 
+        healthy = sum(1 for a in _account_objects if a.is_healthy)
+        if healthy == 0:
+            raise RuntimeError(
+                "All accounts blocked by Cloudflare. "
+                "Cookies were generated from a different IP than this server. "
+                "Regenerate cookies from the same IP, or use a proxy (CLAUDE_PROXY)."
+            )
+
         _provider_ready = True
-        print(f"[startup] ✓ Claude ready — {len(_accounts)} account(s)")
+        print(f"[startup] ✓ Claude ready — {len(_accounts)} account(s), {healthy} healthy")
     except Exception as e:
         _init_error = str(e)
         print(f"[startup] ✗ Claude init failed: {e}")
@@ -330,8 +346,9 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
             if "overloaded" in err_msg.lower() or "temporarily" in err_msg.lower():
                 time.sleep(3)
                 continue
-            if "403" in err_msg:
-                time.sleep(2)
+            if "403" in err_msg or "Just a moment" in err_msg or "cloudflare" in err_msg.lower():
+                print(f"[stream] {acc.label} blocked by Cloudflare challenge (403). "
+                      f"cf_clearance may be stale or IP-mismatched.", flush=True)
                 continue
             raise
 
