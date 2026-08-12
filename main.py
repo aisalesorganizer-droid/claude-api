@@ -121,7 +121,17 @@ from claude_client import (
 
 # ─── Supported models ─────────────────────────────────────────────────────────
 
-SUPPORTED_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-6"]
+SUPPORTED_MODELS = [
+    # Confirmed from HAR analysis 2026-08-12
+    "claude-haiku-4-5-20251001",   # mode-only thinking (off / extended), no effort field
+    "claude-sonnet-4-6",           # thinking off/auto | effort: low/medium/high/max
+    "claude-sonnet-5",             # thinking off/auto | effort: low/medium/high/xhigh/max
+    "claude-opus-4-6",             # thinking extended | effort: low/medium/high/max
+    "claude-opus-4-7",             # thinking auto     | effort: low/medium/high/xhigh/max
+    "claude-opus-4-8",             # thinking auto     | effort: low/medium/high/max
+    "claude-fable-5",              # thinking auto     | effort: high  (may 403 on free accounts)
+    "claude-opus-5",               # thinking auto     | effort: high  (may 403 on free accounts)
+]
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 
@@ -260,6 +270,8 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
                 _slot_states[label] = _SlotState(label, data, None)
 
             state = _slot_states[label]
+            state.conv_id = None
+            state.last_asst_uuid = None
             for chunk in _stream_on_slot(state, prompt, model, file_attachments):
                 yield chunk
 
@@ -275,6 +287,12 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
                 _slot_states.pop(label, None)
                 continue
             if "429" in err_msg:
+                time.sleep(2)
+                continue
+            if "overloaded" in err_msg.lower() or "temporarily" in err_msg.lower():
+                time.sleep(3)
+                continue
+            if "403" in err_msg:
                 time.sleep(2)
                 continue
             raise

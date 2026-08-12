@@ -52,8 +52,37 @@ PROXY_ENV = os.environ.get("CLAUDE_PROXY", "")
 SSE_DEBUG = os.environ.get("CLAUDE_SSE_DEBUG", "0") == "1"
 POOL_DIR  = Path(os.environ.get("CLAUDE_POOL_DIR", "claude_pool"))
 
+# ─── Model configuration (source: HAR analysis 2026-08-12) ────────────────────
+# thinking_mode : "off" | "auto" | "extended"
+# effort        : "low" | "medium" | "high" | "xhigh" | "max" | None
+#                 None  → field must be OMITTED (Haiku uses mode-only, no effort)
+MODEL_CONFIGS: dict = {
+    # Haiku 4.5 — mode-only thinking schema, effort field must not be sent
+    "claude-haiku-4-5-20251001": {"thinking_mode": "off",      "effort": None},
+
+    # Sonnet 4.6 — effort_and_mode, 4 levels (low/medium/high/max), no xhigh
+    "claude-sonnet-4-6":         {"thinking_mode": "off",      "effort": "high"},
+
+    # Sonnet 5 — effort_and_mode, 5 levels (adds xhigh between high and max)
+    "claude-sonnet-5":           {"thinking_mode": "auto",     "effort": "medium"},
+
+    # Opus 4.6 — extended thinking mode by default
+    "claude-opus-4-6":           {"thinking_mode": "extended", "effort": "medium"},
+
+    # Opus 4.7 — xhigh effort default
+    "claude-opus-4-7":           {"thinking_mode": "auto",     "effort": "xhigh"},
+
+    # Opus 4.8
+    "claude-opus-4-8":           {"thinking_mode": "auto",     "effort": "high"},
+
+    # Frontier models (in selector state; may 403 on free accounts)
+    "claude-fable-5":            {"thinking_mode": "auto",     "effort": "high"},
+    "claude-opus-5":             {"thinking_mode": "auto",     "effort": "high"},
+}
+_DEFAULT_MODEL_CONFIG: dict = {"thinking_mode": "off", "effort": "high"}
+
 BASE_URL         = "https://claude.ai"
-REFRESH_DAYS     = 7
+REFRESH_DAYS     = 0
 ROTATION_FILE    = POOL_DIR / "rotation.json"
 
 _CLIENT_SHA      = "2aa88381b74d2cd481c2dc6b403ca7cfbb8f5c2d"
@@ -449,13 +478,13 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     human_uuid = uuid7()
     asst_uuid  = uuid7()
 
+    _cfg = MODEL_CONFIGS.get(model, _DEFAULT_MODEL_CONFIG)
     body: dict = {
         "prompt":             prompt,
         "timezone":           os.environ.get("ZAI_TIMEZONE", "Asia/Taipei"),
         "locale":             "en-US",
         "model":              model,
-        "effort":             "high",
-        "thinking_mode":      "off",
+        "thinking_mode":      _cfg["thinking_mode"],
         "attachments":        file_attachments or [],
         "files":              [],
         "sync_sources":       [],
@@ -465,6 +494,8 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
             "assistant_message_uuid": asst_uuid,
         },
     }
+    if _cfg["effort"] is not None:          # Haiku: omit; all others: include
+        body["effort"] = _cfg["effort"]
     if state.last_asst_uuid:
         body["parent_message_uuid"] = state.last_asst_uuid
 
