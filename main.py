@@ -585,9 +585,33 @@ async def oai_chat(request: Request):
     model = req.model if req.model in MODEL_CONFIGS else MODEL
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    prompt = "\n\n".join(
-        f"[{m['role'].upper()}]: {m['content']}" for m in messages
+
+    # ── Prompt assembly: Claude web API format ────────────────────────────────
+    # The completion endpoint has a single `prompt` field — no native system param.
+    # Correct format: <system> block first, then Human:/Assistant: turn pairs.
+    parts = []
+
+    # 1. Extract system message (if any) → wrap in <system> XML tag
+    system_content = next(
+        (m["content"] for m in messages if m["role"] == "system"), None
     )
+    if system_content:
+        parts.append(f"<system>\n{system_content}\n</system>")
+
+    # 2. Build Human/Assistant turns from non-system messages
+    for m in messages:
+        if m["role"] == "system":
+            continue
+        if m["role"] == "user":
+            parts.append(f"\n\nHuman: {m['content']}")
+        elif m["role"] == "assistant":
+            parts.append(f"\n\nAssistant: {m['content']}")
+
+    # 3. Trailing Assistant: marker so Claude knows it's its turn to respond
+    parts.append("\n\nAssistant:")
+
+    prompt = "".join(parts)
+
     last_user = next(
         (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
     )

@@ -559,7 +559,8 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
         raise RuntimeError("[{}] HTTP {} {}".format(slot, r.status_code, r.text[:300]))
 
     chunks = []
-    got_content = False
+    got_content = False   # True once any text_delta is received
+    got_thinking = False  # True once any thinking_delta is received
 
     for raw in r.iter_lines():
         line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
@@ -581,15 +582,22 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
 
         if etype == "content_block_delta":
             delta = evt.get("delta", {})
-            if delta.get("type") == "text_delta":
+            dtype = delta.get("type")
+            if dtype == "text_delta":
                 chunk = delta.get("text", "")
                 if chunk:
                     chunks.append(chunk)
                     got_content = True
                     yield chunk
+            elif dtype == "thinking_delta":
+                # thinking tokens: track but do not yield to caller
+                got_thinking = True
 
         elif etype == "message_stop":
-            if not got_content:
+            # Valid stop conditions:
+            # 1. got text content (normal)
+            # 2. got only thinking but no text (model thought but said nothing — treat as empty, not error)
+            if not got_content and not got_thinking:
                 state.conv_id        = None
                 state.last_asst_uuid = None
                 raise RuntimeError("[{}] message_stop with no content — session may be expired".format(slot))
