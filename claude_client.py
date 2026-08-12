@@ -57,29 +57,58 @@ POOL_DIR  = Path(os.environ.get("CLAUDE_POOL_DIR", "claude_pool"))
 # effort        : "low" | "medium" | "high" | "xhigh" | "max" | None
 #                 None  → field must be OMITTED (Haiku uses mode-only, no effort)
 MODEL_CONFIGS: dict = {
-    # Haiku 4.5 — mode-only thinking schema, effort field must not be sent
-    "claude-haiku-4-5-20251001": {"thinking_mode": "off",      "effort": None},
+    # ── Haiku 4.5 — mode-only (no effort field) ──────────────────────────────
+    "claude-haiku-4-5":             {"model": "claude-haiku-4-5-20251001", "thinking_mode": "off",      "effort": None},
+    "claude-haiku-4-5 (Extended)":  {"model": "claude-haiku-4-5-20251001", "thinking_mode": "extended", "effort": None},
+    # canonical key (internal, not in display list)
+    "claude-haiku-4-5-20251001":    {"model": "claude-haiku-4-5-20251001", "thinking_mode": "off",      "effort": None},
 
-    # Sonnet 4.6 — effort_and_mode, 4 levels (low/medium/high/max), no xhigh
-    "claude-sonnet-4-6":         {"thinking_mode": "off",      "effort": "high"},
+    # ── Sonnet 4.6 — effort_and_mode, 4 levels, no xhigh ────────────────────
+    "claude-sonnet-4-6 Low":              {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "low"},
+    "claude-sonnet-4-6 Medium":           {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "medium"},
+    "claude-sonnet-4-6 High":             {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "high"},
+    "claude-sonnet-4-6 Max":              {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "max"},
+    "claude-sonnet-4-6 Low + Think":      {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "low"},
+    "claude-sonnet-4-6 Medium + Think":   {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "medium"},
+    "claude-sonnet-4-6 High + Think":     {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "high"},
+    "claude-sonnet-4-6 Max + Think":      {"model": "claude-sonnet-4-6", "thinking_mode": "auto", "effort": "max"},
+    # canonical key (default: high, no thinking)
+    "claude-sonnet-4-6":                  {"model": "claude-sonnet-4-6", "thinking_mode": "off",  "effort": "high"},
 
-    # Sonnet 5 — effort_and_mode, 5 levels (adds xhigh between high and max)
-    "claude-sonnet-5":           {"thinking_mode": "auto",     "effort": "medium"},
+    # ── Sonnet 5 — effort_and_mode, 5 levels (adds xhigh) ───────────────────
+    "claude-sonnet-5 Low":                {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "low"},
+    "claude-sonnet-5 Medium":             {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "medium"},
+    "claude-sonnet-5 High":               {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "high"},
+    "claude-sonnet-5 XHigh":              {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "xhigh"},
+    "claude-sonnet-5 Max":                {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "max"},
+    "claude-sonnet-5 Low + Think":        {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "low"},
+    "claude-sonnet-5 Medium + Think":     {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "medium"},
+    "claude-sonnet-5 High + Think":       {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "high"},
+    "claude-sonnet-5 XHigh + Think":      {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "xhigh"},
+    "claude-sonnet-5 Max + Think":        {"model": "claude-sonnet-5", "thinking_mode": "auto", "effort": "max"},
+    # canonical key (default: medium, no thinking)
+    "claude-sonnet-5":                    {"model": "claude-sonnet-5", "thinking_mode": "off",  "effort": "medium"},
 
-    # Opus 4.6 — extended thinking mode by default
-    "claude-opus-4-6":           {"thinking_mode": "extended", "effort": "medium"},
+    # ── Opus models ───────────────────────────────────────────────────────────
+    "claude-opus-4-6":  {"model": "claude-opus-4-6", "thinking_mode": "extended", "effort": "medium"},
+    "claude-opus-4-7":  {"model": "claude-opus-4-7", "thinking_mode": "auto",     "effort": "xhigh"},
+    "claude-opus-4-8":  {"model": "claude-opus-4-8", "thinking_mode": "auto",     "effort": "high"},
 
-    # Opus 4.7 — xhigh effort default
-    "claude-opus-4-7":           {"thinking_mode": "auto",     "effort": "xhigh"},
-
-    # Opus 4.8
-    "claude-opus-4-8":           {"thinking_mode": "auto",     "effort": "high"},
-
-    # Frontier models (in selector state; may 403 on free accounts)
-    "claude-fable-5":            {"thinking_mode": "auto",     "effort": "high"},
-    "claude-opus-5":             {"thinking_mode": "auto",     "effort": "high"},
+    # ── Frontier (in selector; may 403 on free accounts) ──────────────────────
+    "claude-fable-5":   {"model": "claude-fable-5", "thinking_mode": "auto", "effort": "high"},
+    "claude-opus-5":    {"model": "claude-opus-5",  "thinking_mode": "auto", "effort": "high"},
 }
-_DEFAULT_MODEL_CONFIG: dict = {"thinking_mode": "off", "effort": "high"}
+_DEFAULT_MODEL_CONFIG: dict = {"model": "claude-sonnet-4-6", "thinking_mode": "off", "effort": "high"}
+
+
+def resolve_model(display_name: str) -> tuple:
+    """
+    Given a display name (e.g. 'claude-sonnet-4-6 High + Think'),
+    return (real_model_string, thinking_mode, effort).
+    effort may be None for Haiku. Falls back to default if unknown.
+    """
+    cfg = MODEL_CONFIGS.get(display_name, _DEFAULT_MODEL_CONFIG)
+    return cfg["model"], cfg["thinking_mode"], cfg["effort"]
 
 BASE_URL         = "https://claude.ai"
 REFRESH_DAYS     = 0
@@ -471,20 +500,21 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     slot = state.slot
     s    = state.http
 
+    real_model, thinking_mode, effort = resolve_model(model)
+
     if state.conv_id is None:
-        state.conv_id       = create_conversation(s, state.org_id, state.device_id, model)
+        state.conv_id       = create_conversation(s, state.org_id, state.device_id, real_model)
         state.last_asst_uuid = None
 
     human_uuid = uuid7()
     asst_uuid  = uuid7()
 
-    _cfg = MODEL_CONFIGS.get(model, _DEFAULT_MODEL_CONFIG)
     body: dict = {
         "prompt":             prompt,
         "timezone":           os.environ.get("ZAI_TIMEZONE", "Asia/Taipei"),
         "locale":             "en-US",
-        "model":              model,
-        "thinking_mode":      _cfg["thinking_mode"],
+        "model":              real_model,
+        "thinking_mode":      thinking_mode,
         "attachments":        file_attachments or [],
         "files":              [],
         "sync_sources":       [],
@@ -494,8 +524,8 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
             "assistant_message_uuid": asst_uuid,
         },
     }
-    if _cfg["effort"] is not None:          # Haiku: omit; all others: include
-        body["effort"] = _cfg["effort"]
+    if effort is not None:          # Haiku: omit effort field; all others: include
+        body["effort"] = effort
     if state.last_asst_uuid:
         body["parent_message_uuid"] = state.last_asst_uuid
 

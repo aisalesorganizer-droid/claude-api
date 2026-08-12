@@ -116,21 +116,50 @@ _cc_module.POOL_DIR = _tmpdir
 from claude_client import (
     _make_curl_session, create_conversation, _stream_on_slot, _SlotState,
     upload_file, list_accounts, load_slot_session, ensure_slot,
-    BASE_URL, MODEL, CURL_AVAILABLE
+    BASE_URL, MODEL, CURL_AVAILABLE, MODEL_CONFIGS, resolve_model
 )
 
 # ─── Supported models ─────────────────────────────────────────────────────────
 
 SUPPORTED_MODELS = [
-    # Confirmed from HAR analysis 2026-08-12
-    "claude-haiku-4-5-20251001",   # mode-only thinking (off / extended), no effort field
-    "claude-sonnet-4-6",           # thinking off/auto | effort: low/medium/high/max
-    "claude-sonnet-5",             # thinking off/auto | effort: low/medium/high/xhigh/max
-    "claude-opus-4-6",             # thinking extended | effort: low/medium/high/max
-    "claude-opus-4-7",             # thinking auto     | effort: low/medium/high/xhigh/max
-    "claude-opus-4-8",             # thinking auto     | effort: low/medium/high/max
-    "claude-fable-5",              # thinking auto     | effort: high  (may 403 on free accounts)
-    "claude-opus-5",               # thinking auto     | effort: high  (may 403 on free accounts)
+    # ── Haiku 4.5 (no effort field, mode-only) ────────────────────────────────
+    "claude-haiku-4-5",
+    "claude-haiku-4-5 (Extended)",
+
+    # ── Sonnet 4.6 (thinking off) ─────────────────────────────────────────────
+    "claude-sonnet-4-6 Low",
+    "claude-sonnet-4-6 Medium",
+    "claude-sonnet-4-6 High",
+    "claude-sonnet-4-6 Max",
+
+    # ── Sonnet 4.6 (thinking on) ──────────────────────────────────────────────
+    "claude-sonnet-4-6 Low + Think",
+    "claude-sonnet-4-6 Medium + Think",
+    "claude-sonnet-4-6 High + Think",
+    "claude-sonnet-4-6 Max + Think",
+
+    # ── Sonnet 5 (thinking off) ───────────────────────────────────────────────
+    "claude-sonnet-5 Low",
+    "claude-sonnet-5 Medium",
+    "claude-sonnet-5 High",
+    "claude-sonnet-5 XHigh",
+    "claude-sonnet-5 Max",
+
+    # ── Sonnet 5 (thinking on) ────────────────────────────────────────────────
+    "claude-sonnet-5 Low + Think",
+    "claude-sonnet-5 Medium + Think",
+    "claude-sonnet-5 High + Think",
+    "claude-sonnet-5 XHigh + Think",
+    "claude-sonnet-5 Max + Think",
+
+    # ── Opus models ───────────────────────────────────────────────────────────
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+
+    # ── Frontier (may 403 on free accounts) ───────────────────────────────────
+    "claude-fable-5",
+    "claude-opus-5",
 ]
 
 # ─── Global state ─────────────────────────────────────────────────────────────
@@ -454,7 +483,7 @@ async def chat(req: ChatRequest):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
-    model = req.model if req.model in SUPPORTED_MODELS else MODEL
+    model = req.model if req.model in MODEL_CONFIGS else MODEL
 
     try:
         loop = asyncio.get_event_loop()
@@ -552,7 +581,8 @@ async def oai_chat(request: Request):
         file_attachments = [{"file_uuid": fid, "file_type": "application/pdf"} for fid in file_uuids]
         print(f"[oai] file_attachments: {file_attachments}")
 
-    model = req.model if req.model in SUPPORTED_MODELS else MODEL
+    # Accept both display names (SUPPORTED_MODELS) and canonical keys (MODEL_CONFIGS)
+    model = req.model if req.model in MODEL_CONFIGS else MODEL
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     prompt = "\n\n".join(
