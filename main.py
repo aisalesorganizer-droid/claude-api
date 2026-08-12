@@ -122,44 +122,44 @@ from claude_client import (
 # ─── Supported models ─────────────────────────────────────────────────────────
 
 SUPPORTED_MODELS = [
-    # ── Haiku 4.5 (no effort field, mode-only) ────────────────────────────────
+    # ── Haiku 4.5 — mode-only, no effort field ───────────────────────────────
     "claude-haiku-4-5",
     "claude-haiku-4-5 (Extended)",
 
-    # ── Sonnet 4.6 (thinking off) ─────────────────────────────────────────────
+    # ── Sonnet 4.6 — no thinking: low → medium → high → max ─────────────────
     "claude-sonnet-4-6 Low",
     "claude-sonnet-4-6 Medium",
     "claude-sonnet-4-6 High",
     "claude-sonnet-4-6 Max",
-
-    # ── Sonnet 4.6 (thinking on) ──────────────────────────────────────────────
+    # ── Sonnet 4.6 — thinking on: low → medium → high → max ──────────────────
     "claude-sonnet-4-6 Low + Think",
     "claude-sonnet-4-6 Medium + Think",
     "claude-sonnet-4-6 High + Think",
     "claude-sonnet-4-6 Max + Think",
 
-    # ── Sonnet 5 (thinking off) ───────────────────────────────────────────────
+    # ── Sonnet 5 — no thinking: low → medium → high → xhigh → max ───────────
     "claude-sonnet-5 Low",
     "claude-sonnet-5 Medium",
     "claude-sonnet-5 High",
     "claude-sonnet-5 XHigh",
     "claude-sonnet-5 Max",
-
-    # ── Sonnet 5 (thinking on) ────────────────────────────────────────────────
+    # ── Sonnet 5 — thinking on: low → medium → high → xhigh → max ───────────
     "claude-sonnet-5 Low + Think",
     "claude-sonnet-5 Medium + Think",
     "claude-sonnet-5 High + Think",
     "claude-sonnet-5 XHigh + Think",
     "claude-sonnet-5 Max + Think",
 
-    # ── Opus models ───────────────────────────────────────────────────────────
+    # ── Opus 4.6 / 4.7 / 4.8 ────────────────────────────────────────────────
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
 
-    # ── Frontier (may 403 on free accounts) ───────────────────────────────────
-    "claude-fable-5",
+    # ── Opus 5 ───────────────────────────────────────────────────────────────
     "claude-opus-5",
+
+    # ── Fable 5 (may 403 on free accounts) ───────────────────────────────────
+    "claude-fable-5",
 ]
 
 # ─── Global state ─────────────────────────────────────────────────────────────
