@@ -805,6 +805,104 @@ class AntRequest(BaseModel):
     model_config = {"extra": "ignore"}    # swallow any other Claude Code fields
 
 
+def _protocol_block_summary(block) -> dict:
+    if not isinstance(block, dict):
+        return {"type": type(block).__name__}
+    out = {"type": block.get("type", "<missing>")}
+    for key in ("id", "tool_use_id", "name"):
+        value = block.get(key)
+        if value is not None:
+            out[key] = value
+    if out["type"] == "text":
+        text = block.get("text", "")
+        out["text_len"] = len(text) if isinstance(text, str) else 0
+    elif out["type"] == "tool_result":
+        content = block.get("content")
+        out["content_type"] = type(content).__name__
+        if isinstance(content, str):
+            out["content_len"] = len(content)
+        elif isinstance(content, list):
+            out["content_blocks"] = [b.get("type") for b in content if isinstance(b, dict)]
+    elif out["type"] == "tool_use":
+        input_value = block.get("input")
+        out["input_keys"] = sorted(input_value.keys()) if isinstance(input_value, dict) else []
+    return out
+
+
+def _protocol_schema_summary(schema) -> dict:
+    if not isinstance(schema, dict):
+        return {"type": type(schema).__name__}
+    properties = schema.get("properties")
+    return {
+        "type": schema.get("type"),
+        "required": schema.get("required", []),
+        "property_names": sorted(properties.keys()) if isinstance(properties, dict) else [],
+        "additionalProperties": schema.get("additionalProperties"),
+    }
+
+
+def _protocol_tool_summary(tool) -> dict:
+    if not isinstance(tool, dict):
+        return {"type": type(tool).__name__}
+    return {
+        "name": tool.get("name"),
+        "description_len": len(tool.get("description", "")) if isinstance(tool.get("description"), str) else 0,
+        "input_schema": _protocol_schema_summary(tool.get("input_schema")),
+    }
+
+
+def _log_protocol_request(request_id: str, raw_body: dict, request: Request) -> None:
+    known_keys = set(AntRequest.model_fields)
+    messages = raw_body.get("messages") if isinstance(raw_body.get("messages"), list) else []
+    message_summary = []
+    for message in messages:
+        if not isinstance(message, dict):
+            message_summary.append({"type": type(message).__name__})
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [content]
+        message_summary.append({
+            "role": message.get("role"),
+            "content_types": [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in blocks],
+            "blocks": [_protocol_block_summary(b) for b in blocks],
+        })
+
+    system = raw_body.get("system")
+    system_blocks = system if isinstance(system, list) else ([system] if system is not None else [])
+    tools = raw_body.get("tools") if isinstance(raw_body.get("tools"), list) else []
+
+    protocol_headers = {}
+    for name in (
+        "anthropic-version", "anthropic-beta", "user-agent", "x-app",
+        "x-claude-code-session-id", "content-type", "content-length",
+        "x-anthropic-billing-header",
+    ):
+        value = request.headers.get(name)
+        if value is not None:
+            protocol_headers[name] = value
+
+    snapshot = {
+        "request_id": request_id,
+        "model": raw_body.get("model"),
+        "stream": raw_body.get("stream"),
+        "top_level_keys": sorted(raw_body.keys()),
+        "unknown_top_level_keys": sorted(k for k in raw_body.keys() if k not in known_keys),
+        "message_count": len(messages),
+        "messages": message_summary,
+        "system": {
+            "kind": type(system).__name__ if system is not None else None,
+            "block_types": [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in system_blocks],
+            "block_count": len(system_blocks),
+        },
+        "tool_count": len(tools),
+        "tools": [_protocol_tool_summary(tool) for tool in tools],
+        "tool_choice": raw_body.get("tool_choice"),
+        "metadata_keys": sorted(raw_body.get("metadata", {}).keys()) if isinstance(raw_body.get("metadata"), dict) else [],
+        "protocol_headers": protocol_headers,
+    }
+    print(f"[protocol] REQUEST {json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))}", flush=True)
+
+
 def _ant_extract_text(content) -> str:
     """Pull plain text out of either a str or a content-block list."""
     if isinstance(content, str):
@@ -1011,6 +1109,56 @@ def _to_ant_stream(
     yield _evt("message_stop", {"type": "message_stop"})
 
 
+def _capture_ant_stream(source: Generator[str, None, None], request_id: str) -> Generator[str, None, None]:
+    """Pass through Anthropic SSE events while recording one compact response summary."""
+    capture = os.getenv("CLAUDE_PROTOCOL_CAPTURE", "0") == "1"
+    events: list[str] = []
+    blocks: list[dict] = []
+    stop_reason = None
+    error = None
+
+    try:
+        for chunk in source:
+            if capture:
+                event_name = None
+                data_obj = None
+                for line in chunk.splitlines():
+                    if line.startswith("event: "):
+                        event_name = line[7:]
+                    elif line.startswith("data: "):
+                        try:
+                            data_obj = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            data_obj = None
+                if event_name:
+                    events.append(event_name)
+                if isinstance(data_obj, dict):
+                    if data_obj.get("type") == "content_block_start":
+                        block = data_obj.get("content_block") or {}
+                        blocks.append({
+                            "index": data_obj.get("index"),
+                            "type": block.get("type"),
+                            "id": block.get("id"),
+                            "name": block.get("name"),
+                        })
+                    elif data_obj.get("type") == "message_delta":
+                        delta = data_obj.get("delta") or {}
+                        stop_reason = delta.get("stop_reason")
+                    elif data_obj.get("type") == "error":
+                        error = (data_obj.get("error") or {}).get("message")
+            yield chunk
+    finally:
+        if capture:
+            snapshot = {
+                "request_id": request_id,
+                "events": events,
+                "content_blocks": blocks,
+                "stop_reason": stop_reason,
+                "error": error,
+            }
+            print(f"[protocol] RESPONSE {json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))}", flush=True)
+
+
 def _ant_error_event(message: str, err_type: str = "server_error") -> str:
     """Return a well-formed Anthropic error SSE event so Claude Code can surface it."""
     return (
@@ -1036,17 +1184,9 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         }
     """
     raw_body = await request.json()
-
-    print("\n===== CLAUDE CODE REQUEST =====")
-    print(json.dumps(raw_body, indent=2, ensure_ascii=False))
-    print("===== HEADERS =====")
-
-    for k, v in request.headers.items():
-        if k.lower() in {"authorization", "cookie", "x-api-key"}:
-            v = "<REDACTED>"
-        print(f"{k}: {v}")
-
-    print("===== END REQUEST =====\n")
+    protocol_request_id = uuid.uuid4().hex[:16]
+    if os.getenv("CLAUDE_PROTOCOL_CAPTURE", "0") == "1":
+        _log_protocol_request(protocol_request_id, raw_body, request)
 
     try:
         req = AntRequest(**raw_body)
@@ -1094,7 +1234,7 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         print("[PROBE] Sending synthetic Read tool_use")
 
         return StreamingResponse(
-            _probe_tool_stream(model, msg_id),
+            _capture_ant_stream(_probe_tool_stream(model, msg_id), protocol_request_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1148,7 +1288,7 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
                     yield _ant_error_event(err, "server_error")
 
         return StreamingResponse(
-            stream_generator(),
+            _capture_ant_stream(stream_generator(), protocol_request_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control":   "no-cache",
@@ -1170,6 +1310,14 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         output_tokens = len(answer.split())
 
         print(f"[ant] answer={answer[:200]}")
+        if os.getenv("CLAUDE_PROTOCOL_CAPTURE", "0") == "1":
+            snapshot = {
+                "request_id": protocol_request_id,
+                "mode": "non_stream",
+                "content_blocks": [{"index": 0, "type": "text", "text_len": len(answer)}],
+                "stop_reason": "end_turn",
+            }
+            print(f"[protocol] RESPONSE {json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))}", flush=True)
 
         return {
             "id":            msg_id,
