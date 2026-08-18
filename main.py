@@ -1,7 +1,7 @@
 """
 main.py — FastAPI wrapper for claude_client.py
 ===============================================
-OpenAI-compatible API endpoint for Claude.ai web client.
+Dual-protocol API endpoint for Claude.ai web client.
 
 Account injection (Render/Railway env vars):
   CLAUDE_ACCOUNT      — single account JSON, base64-encoded
@@ -18,6 +18,7 @@ Endpoints:
   GET  /v1/models           model list
   POST /chat                simple {message} -> {response}
   POST /v1/chat/completions OpenAI-compatible (streaming + non-streaming)
+  POST /v1/messages         Anthropic Messages API-compatible (for Claude Code)
   POST /v1/files/upload     multipart/form-data file upload -> {file_id, filename, status}
 """
 
@@ -757,4 +758,337 @@ async def oai_chat(request: Request, _=Depends(require_auth)):
         raise
     except Exception as e:
         print(f"[oai] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Anthropic Messages API  —  /v1/messages
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Claude Code points ANTHROPIC_BASE_URL at this server and calls POST /v1/messages
+# using the native Anthropic wire format.  We translate that into the same
+# _stream_claude() pipeline used by /v1/chat/completions, then emit proper
+# Anthropic SSE events so Claude Code gets exactly what it expects.
+#
+# Anthropic streaming event sequence:
+#   message_start
+#   content_block_start   (index=0, type="text")
+#   ping                  (keepalive)
+#   content_block_delta   (repeating, type="text_delta")
+#   content_block_stop
+#   message_delta         (stop_reason="end_turn", usage)
+#   message_stop
+#
+# Non-streaming response mirrors the /v1/messages shape:
+#   {id, type, role, content:[{type,text}], model, stop_reason, usage}
+# ───────────────────────────────────────────────────────────────────────────────
+
+class _AntContentBlock(BaseModel):
+    type: str
+    text: str
+
+
+class _AntMessage(BaseModel):
+    role: str
+    content: str | list  # str for simple text; list for content-block arrays
+
+
+class AntRequest(BaseModel):
+    model: str = "claude-sonnet-4-6"
+    messages: List[_AntMessage]
+    system: Optional[str] = None          # top-level system prompt (preferred)
+    max_tokens: Optional[int] = 8096
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None   # accepted, ignored (web API doesn't expose it)
+    top_p: Optional[float] = None         # accepted, ignored
+    top_k: Optional[int] = None           # accepted, ignored
+    model_config = {"extra": "ignore"}    # swallow any other Claude Code fields
+
+
+def _ant_extract_text(content) -> str:
+    """Pull plain text out of either a str or a content-block list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
+def _ant_build_prompt(req: AntRequest) -> str:
+    """
+    Assemble the Claude web-API prompt string from an Anthropic Messages request.
+
+    System prompt priority:
+      1. Top-level `system` field  (Claude Code always uses this)
+      2. A message with role="system" in the messages list  (legacy fallback)
+
+    Prompt format matches what _stream_on_slot() expects — same as oai_chat.
+    """
+    parts: list[str] = []
+
+    # 1. System prompt
+    system_text: Optional[str] = None
+    if req.system:
+        system_text = req.system.strip()
+    else:
+        for m in req.messages:
+            if m.role == "system":
+                system_text = _ant_extract_text(m.content).strip()
+                break
+
+    if system_text:
+        parts.append(f"<s>\n{system_text}\n</s>")
+
+    # 2. Conversation turns (skip system role — already handled above)
+    for m in req.messages:
+        if m.role == "system":
+            continue
+        text = _ant_extract_text(m.content)
+        if m.role == "user":
+            parts.append(f"\n\nHuman: {text}")
+        elif m.role == "assistant":
+            parts.append(f"\n\nAssistant: {text}")
+
+    # 3. Trailing assistant turn marker (only when last non-system turn is from user)
+    last_non_sys = next(
+        (m for m in reversed(req.messages) if m.role != "system"), None
+    )
+    if last_non_sys is None or last_non_sys.role == "user":
+        parts.append("\n\nAssistant:")
+
+    return "".join(parts)
+
+
+def _to_ant_stream(
+    claude_chunks: Generator[str, None, None],
+    model: str,
+    msg_id: str,
+) -> Generator[str, None, None]:
+    """
+    Convert Claude text-chunk generator → Anthropic SSE event stream.
+
+    Emits the exact sequence Claude Code expects:
+      message_start → content_block_start → ping →
+      content_block_delta* → content_block_stop →
+      message_delta → message_stop
+    """
+    input_tokens  = 0   # we don't have real counts; send 0 — Claude Code ignores them
+    output_tokens = 0
+
+    def _evt(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    # ── message_start ──────────────────────────────────────────────────────────
+    yield _evt("message_start", {
+        "type": "message_start",
+        "message": {
+            "id":           msg_id,
+            "type":         "message",
+            "role":         "assistant",
+            "content":      [],
+            "model":        model,
+            "stop_reason":  None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens":  input_tokens,
+                "output_tokens": output_tokens,
+            },
+        },
+    })
+
+    # ── content_block_start ────────────────────────────────────────────────────
+    yield _evt("content_block_start", {
+        "type":  "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+    # ── ping (keepalive — Claude Code expects at least one) ────────────────────
+    yield _evt("ping", {"type": "ping"})
+
+    # ── content_block_delta* ───────────────────────────────────────────────────
+    for chunk in claude_chunks:
+        if chunk:
+            output_tokens += len(chunk.split())
+            yield _evt("content_block_delta", {
+                "type":  "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": chunk},
+            })
+
+    # ── content_block_stop ─────────────────────────────────────────────────────
+    yield _evt("content_block_stop", {
+        "type":  "content_block_stop",
+        "index": 0,
+    })
+
+    # ── message_delta (stop reason + final usage) ──────────────────────────────
+    yield _evt("message_delta", {
+        "type":  "message_delta",
+        "delta": {
+            "stop_reason":   "end_turn",
+            "stop_sequence": None,
+        },
+        "usage": {"output_tokens": output_tokens},
+    })
+
+    # ── message_stop ───────────────────────────────────────────────────────────
+    yield _evt("message_stop", {"type": "message_stop"})
+
+
+def _ant_error_event(message: str, err_type: str = "server_error") -> str:
+    """Return a well-formed Anthropic error SSE event so Claude Code can surface it."""
+    return (
+        f"event: error\n"
+        f"data: {json.dumps({'type': 'error', 'error': {'type': err_type, 'message': message}})}\n\n"
+    )
+
+
+@app.post("/v1/messages")
+async def ant_messages(request: Request, _=Depends(require_auth)):
+    """
+    Anthropic Messages API endpoint.
+
+    Accepts the native Anthropic POST /v1/messages body and returns the native
+    Anthropic response format (streaming or non-streaming).
+
+    Set in Claude Code's ~/.claude/settings.json:
+        {
+          "env": {
+            "ANTHROPIC_BASE_URL": "https://<your-railway-app>.railway.app",
+            "ANTHROPIC_AUTH_TOKEN": "<your-CLAUDE_API_KEY>"
+          }
+        }
+    """
+    raw_body = await request.json()
+    print(f"[ant] RAW BODY: {json.dumps(raw_body)[:300]}")
+
+    try:
+        req = AntRequest(**raw_body)
+    except Exception as e:
+        print(f"[ant] PARSE ERROR: {e}")
+        raise HTTPException(status_code=422, detail=str(e))
+
+    _guard()
+
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+    # Resolve model — fall back to default if not recognised
+    model = req.model if req.model in MODEL_CONFIGS else MODEL
+
+    # Build the Claude web-API prompt
+    prompt = _ant_build_prompt(req)
+
+    last_user = next(
+        (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
+        "",
+    )
+    print(f"[ant] model={model} stream={req.stream} prompt_tail={last_user[:80]}")
+
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # ── Streaming ──────────────────────────────────────────────────────────────
+    if req.stream:
+        def stream_generator():
+            import queue as _queue
+            q     = _queue.Queue()
+            done  = threading.Event()
+            error_holder: list[Optional[Exception]] = [None]
+
+            def _run_in_thread():
+                try:
+                    for evt in _to_ant_stream(
+                        _stream_claude(prompt, model, None, None),
+                        model,
+                        msg_id,
+                    ):
+                        q.put(evt)
+                except Exception as exc:
+                    error_holder[0] = exc
+                finally:
+                    done.set()
+
+            t = threading.Thread(target=_run_in_thread, daemon=True)
+            t.start()
+
+            while not done.is_set() or not q.empty():
+                try:
+                    yield q.get(timeout=0.1)
+                except _queue.Empty:
+                    if done.is_set():
+                        break
+
+            t.join(timeout=5)
+
+            if error_holder[0]:
+                err = str(error_holder[0])
+                print(f"[ant stream] ERROR: {err}")
+                if "expired" in err.lower() or "401" in err:
+                    yield _ant_error_event(f"Session expired: {err}", "authentication_error")
+                elif "429" in err:
+                    yield _ant_error_event("Rate limited. Try again later.", "rate_limit_error")
+                elif "overloaded" in err.lower():
+                    yield _ant_error_event("Claude is overloaded. Try again shortly.", "overloaded_error")
+                else:
+                    yield _ant_error_event(err, "server_error")
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control":   "no-cache",
+                "X-Accel-Buffering": "no",       # disable nginx buffering on Railway
+            },
+        )
+
+    # ── Non-streaming ──────────────────────────────────────────────────────────
+    try:
+        loop = asyncio.get_event_loop()
+        answer = await loop.run_in_executor(
+            None,
+            lambda: _consume_stream(prompt, model, None, None),
+        )
+
+        input_tokens  = sum(
+            len(_ant_extract_text(m.content).split()) for m in req.messages
+        )
+        output_tokens = len(answer.split())
+
+        print(f"[ant] answer={answer[:200]}")
+
+        return {
+            "id":            msg_id,
+            "type":          "message",
+            "role":          "assistant",
+            "content":       [{"type": "text", "text": answer}],
+            "model":         model,
+            "stop_reason":   "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens":  input_tokens,
+                "output_tokens": output_tokens,
+            },
+        }
+
+    except RuntimeError as e:
+        err = str(e)
+        print(f"[ant] RuntimeError: {err}")
+        if "expired" in err.lower() or "401" in err:
+            raise HTTPException(status_code=401, detail=f"Session expired: {err}")
+        if "429" in err:
+            raise HTTPException(status_code=429, detail="Rate limited. Try again later.")
+        if "overloaded" in err.lower():
+            raise HTTPException(status_code=529, detail="Claude overloaded. Try again.")
+        raise HTTPException(status_code=503, detail=err)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ant] ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
