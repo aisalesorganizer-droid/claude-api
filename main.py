@@ -794,9 +794,9 @@ class _AntMessage(BaseModel):
 
 
 class AntRequest(BaseModel):
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-sonnet-4-6 High"
     messages: List[_AntMessage]
-    system: Optional[str] = None          # top-level system prompt (preferred)
+    system: Optional[str | list] = None   # str or content-block list (Claude Code sends list with cache hints)
     max_tokens: Optional[int] = 8096
     stream: Optional[bool] = False
     temperature: Optional[float] = None   # accepted, ignored (web API doesn't expose it)
@@ -835,7 +835,7 @@ def _ant_build_prompt(req: AntRequest) -> str:
     # 1. System prompt
     system_text: Optional[str] = None
     if req.system:
-        system_text = req.system.strip()
+        system_text = _ant_extract_text(req.system).strip()
     else:
         for m in req.messages:
             if m.role == "system":
