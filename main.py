@@ -980,8 +980,24 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-    # Resolve model — fall back to default if not recognised
-    model = req.model if req.model in MODEL_CONFIGS else MODEL
+    # Models confirmed unsupported on these accounts (plan restriction).
+    # Claude Code sends these by default; remap them to the working fallback.
+    _ANT_MODEL_DENYLIST = {
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-fable-5",
+    }
+    _ANT_FALLBACK = "claude-sonnet-4-6 High"
+
+    if req.model in _ANT_MODEL_DENYLIST:
+        model = _ANT_FALLBACK
+        print(f"[ant] model={req.model!r} not supported — remapped to {_ANT_FALLBACK!r}")
+    elif req.model in MODEL_CONFIGS:
+        model = req.model
+    else:
+        model = MODEL
 
     # Build the Claude web-API prompt
     prompt = _ant_build_prompt(req)
