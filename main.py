@@ -967,7 +967,17 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         }
     """
     raw_body = await request.json()
-    print(f"[ant] RAW BODY: {json.dumps(raw_body)[:300]}")
+
+    print("\n===== CLAUDE CODE REQUEST =====")
+    print(json.dumps(raw_body, indent=2, ensure_ascii=False))
+    print("===== HEADERS =====")
+
+    for k, v in request.headers.items():
+        if k.lower() in {"authorization", "cookie", "x-api-key"}:
+            v = "<REDACTED>"
+        print(f"{k}: {v}")
+
+    print("===== END REQUEST =====\n")
 
     try:
         req = AntRequest(**raw_body)
