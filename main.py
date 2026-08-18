@@ -796,13 +796,24 @@ class _AntMessage(BaseModel):
 class AntRequest(BaseModel):
     model: str = "claude-sonnet-4-6 High"
     messages: List[_AntMessage]
-    system: Optional[str | list] = None   # str or content-block list (Claude Code sends list with cache hints)
+    system: Optional[str | list] = None
     max_tokens: Optional[int] = 8096
     stream: Optional[bool] = False
-    temperature: Optional[float] = None   # accepted, ignored (web API doesn't expose it)
-    top_p: Optional[float] = None         # accepted, ignored
-    top_k: Optional[int] = None           # accepted, ignored
-    model_config = {"extra": "ignore"}    # swallow any other Claude Code fields
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+
+    # Claude Code sends its real tool registry on every agentic request.
+    # These fields MUST survive request parsing; previously extra="ignore"
+    # silently discarded them before the gateway could do anything with them.
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[dict | str] = None
+    metadata: Optional[dict] = None
+    thinking: Optional[dict] = None
+    service_tier: Optional[str] = None
+
+    # Preserve future Anthropic/Claude Code fields instead of silently dropping them.
+    model_config = {"extra": "allow"}
 
 
 def _protocol_block_summary(block) -> dict:
