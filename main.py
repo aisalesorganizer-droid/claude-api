@@ -864,6 +864,75 @@ def _ant_build_prompt(req: AntRequest) -> str:
 
     return "".join(parts)
 
+def _probe_tool_stream(model: str, msg_id: str):
+    def evt(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    tool_id = f"toolu_probe_{uuid.uuid4().hex[:12]}"
+
+    yield evt("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    })
+
+    yield evt("content_block_start", {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": "Read",
+            "input": {},
+        },
+    })
+
+    yield evt("ping", {"type": "ping"})
+
+    input_json = json.dumps({
+        "file_path": "CLAUDE.md"
+    }, separators=(",", ":"))
+
+    yield evt("content_block_delta", {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": input_json,
+        },
+    })
+
+    yield evt("content_block_stop", {
+        "type": "content_block_stop",
+        "index": 0,
+    })
+
+    yield evt("message_delta", {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": "tool_use",
+            "stop_sequence": None,
+        },
+        "usage": {
+            "output_tokens": 1,
+        },
+    })
+
+    yield evt("message_stop", {
+        "type": "message_stop"
+    })
+
 
 def _to_ant_stream(
     claude_chunks: Generator[str, None, None],
@@ -1019,6 +1088,19 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
     print(f"[ant] model={model} stream={req.stream} prompt_tail={last_user[:80]}")
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # TEMPORARY PROTOCOL PROBE
+    if req.stream and os.getenv("PROBE_TOOL_USE") == "1":
+        print("[PROBE] Sending synthetic Read tool_use")
+
+        return StreamingResponse(
+            _probe_tool_stream(model, msg_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ── Streaming ──────────────────────────────────────────────────────────────
     if req.stream:
