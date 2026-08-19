@@ -37,8 +37,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Generator, Iterable
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, Depends
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ─── Account loading from env ─────────────────────────────────────────────────
@@ -251,28 +251,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="claude-api", lifespan=lifespan)
 
-
-@app.get("/__debug/compiled-prompt")
-def debug_compiled_prompt(
-    x_debug_token: str | None = Header(default=None),
-):
-    expected = os.getenv("DEBUG_PROMPT_TOKEN")
-
-    if not expected or x_debug_token != expected:
-        raise HTTPException(status_code=404)
-
-    path = "/tmp/compiled_prompt.txt"
-
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404)
-
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    return PlainTextResponse(content)
-
-
-# ─── Auth guard ─────────────────────────────────────────────────────────────
 
 # ─── Auth guard ───────────────────────────────────────────────────────────────
 
@@ -1023,6 +1001,43 @@ def _ant_extract_text(content) -> str:
     return str(content)
 
 
+def _build_model_tool_protocol(tools: Optional[List[dict]]) -> str:
+    """Put a hard execution contract before the Claude Code system prompt.
+
+    The upstream Claude.ai session does not receive real local tools. It must
+    therefore emit a deterministic tool_call envelope that Railway can parse
+    and translate into native Claude Code tool_use semantics.
+    """
+    definitions = _compile_tool_definitions_for_model(tools)
+    if not definitions:
+        return ""
+
+    return "\n".join((
+        "# TOOL EXECUTION PROTOCOL",
+        "",
+        "You are an execution-oriented software engineering agent.",
+        "When the task requires a local tool, you MUST emit a tool_call before continuing.",
+        "A tool_call is a request for the calling harness to execute the tool; it is not a tool result.",
+        "",
+        "STRICT TOOL-CALL FORMAT:",
+        '<tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>',
+        "",
+        "Rules:",
+        "- Use only tools listed in <available_tools>.",
+        "- The name must exactly match a listed tool.",
+        "- The input object must conform exactly to that tool's input_schema.",
+        "- Emit the tool_call as the action itself; do not describe it in prose.",
+        "- After emitting a tool_call, stop and wait for the harness to return its result.",
+        "- Never fabricate a tool result.",
+        "- Never claim that a local file was read unless a tool result confirms it.",
+        "- Never say that local filesystem access is unavailable when a matching tool is listed.",
+        "",
+        "EXECUTION SEQUENCE:",
+        "USER REQUEST -> SELECT TOOL -> EMIT tool_call -> WAIT FOR TOOL RESULT -> CONTINUE",
+        "",
+        definitions,
+    ))
+
 def _compile_tool_definitions_for_model(tools: Optional[List[dict]]) -> str:
     if not tools:
         return ""
@@ -1116,12 +1131,17 @@ def _ant_build_prompt(req: AntRequest) -> str:
                 system_text = _ant_extract_text(m.content).strip()
                 break
 
-    if system_text:
-        parts.append(f"<s>\n{system_text}\n</s>")
+    if system_text or req.tools:
+        system_parts: list[str] = []
 
-    tool_instructions = _compile_tool_definitions_for_model(req.tools)
-    if tool_instructions:
-        parts.append("\n\n" + tool_instructions)
+        if req.tools:
+            system_parts.append(_build_model_tool_protocol(req.tools))
+
+        if system_text:
+            system_parts.append(system_text)
+
+        compiled_system = "\n\n".join(p for p in system_parts if p)
+        parts.append(f"<s>\n{compiled_system}\n</s>")
 
     # 2. Conversation turns (skip system role — already handled above).
     # Tool-result blocks are preserved as structured state and compiled into a
@@ -1402,7 +1422,7 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         "claude-opus-4-6",
         "claude-fable-5",
     }
-    _ANT_FALLBACK = "claude-sonnet-4-6 Max"
+    _ANT_FALLBACK = "claude-sonnet-4-6 High"
 
     if req.model in _ANT_MODEL_DENYLIST:
         model = _ANT_FALLBACK
@@ -1414,15 +1434,6 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
 
     # Build the Claude web-API prompt
     prompt = _ant_build_prompt(req)
-
-    if os.getenv("CAPTURE_COMPILED_PROMPT") == "1":
-        capture_path = "/tmp/compiled_prompt.txt"
-
-        with open(capture_path, "w", encoding="utf-8") as f:
-            f.write(prompt)
-
-        print(f"COMPILED_PROMPT_FILE={capture_path}", file=sys.stderr)
-        print(f"COMPILED_PROMPT_LENGTH={len(prompt)}", file=sys.stderr)
 
     last_user = next(
         (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
