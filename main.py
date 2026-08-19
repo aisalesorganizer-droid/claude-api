@@ -1380,7 +1380,7 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
         "claude-opus-4-6",
         "claude-fable-5",
     }
-    _ANT_FALLBACK = "claude-sonnet-4-6 High"
+    _ANT_FALLBACK = "claude-sonnet-4-6 Max"
 
     if req.model in _ANT_MODEL_DENYLIST:
         model = _ANT_FALLBACK
@@ -1394,9 +1394,12 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
     prompt = _ant_build_prompt(req)
 
     if os.getenv("CAPTURE_COMPILED_PROMPT") == "1":
-        print("\n========== COMPILED PROMPT START ==========")
-        print(prompt)
-        print("========== COMPILED PROMPT END ==========\n")
+        import base64
+        encoded_prompt = base64.b64encode(
+            prompt.encode("utf-8")
+        ).decode("ascii")
+
+        print(f"COMPILED_PROMPT_B64={encoded_prompt}")
 
     last_user = next(
         (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
