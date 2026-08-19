@@ -1001,41 +1001,160 @@ def _ant_extract_text(content) -> str:
     return str(content)
 
 
-def _build_model_tool_protocol(tools: Optional[List[dict]]) -> str:
-    """Put a hard execution contract before the Claude Code system prompt.
+def _build_example_from_schema(schema: dict) -> dict:
+    """Generate a minimal valid example object from a JSON schema."""
+    example: dict = {}
+    properties = schema.get("properties", {})
+    for key, prop in properties.items():
+        ptype = prop.get("type")
+        if ptype == "string":
+            example[key] = f"<{key}>"
+        elif ptype == "boolean":
+            example[key] = False
+        elif ptype == "integer":
+            example[key] = 0
+        elif ptype == "number":
+            example[key] = 0.0
+        elif ptype == "array":
+            example[key] = []
+        elif ptype == "object":
+            example[key] = {}
+        else:
+            example[key] = None
+    return example
 
-    The upstream Claude.ai session does not receive real local tools. It must
-    therefore emit a deterministic tool_call envelope that Railway can parse
-    and translate into native Claude Code tool_use semantics.
+
+def _build_example_from_schema(schema: dict) -> dict:
+    """Generate a minimal valid example object from a JSON schema."""
+    example: dict = {}
+    properties = schema.get("properties", {})
+    for key, prop in properties.items():
+        ptype = prop.get("type")
+        if ptype == "string":
+            example[key] = f"<{key}>"
+        elif ptype == "boolean":
+            example[key] = False
+        elif ptype == "integer":
+            example[key] = 0
+        elif ptype == "number":
+            example[key] = 0.0
+        elif ptype == "array":
+            example[key] = []
+        elif ptype == "object":
+            example[key] = {}
+        else:
+            example[key] = None
+    return example
+
+def _build_model_tool_protocol(tools: Optional[List[dict]]) -> str:
+    """Generate the tool execution protocol that overrides the web model's
+    default identity and forces deterministic tool-call emission.
+
+    This protocol MUST come FIRST in the compiled prompt, before any system
+    context, so that the deterministic command format overrides the model's
+    default "I am web Claude" anchoring.
     """
-    definitions = _compile_tool_definitions_for_model(tools)
-    if not definitions:
+    if not tools:
         return ""
+
+    # Per-tool documentation with concrete invocation examples
+    tool_docs: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name", "")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        description = tool.get("description", "") if isinstance(tool.get("description"), str) else ""
+        schema = tool.get("input_schema", {}) if isinstance(tool.get("input_schema"), dict) else {}
+
+        example_input = _build_example_from_schema(schema)
+
+        tool_docs.append(
+            f"## {name}\n"
+            f"Purpose: {description}\n"
+            f"Invocation:\n"
+            f'<tool_call> {{\n'
+            f'  "name": "{name}",\n'
+            f'  "input": {json.dumps(example_input, ensure_ascii=False, indent=2, separators=(", ", ": "))}\n'
+            f'}} </tool_call>'
+        )
+
+    tools_section = "\n\n".join(tool_docs)
 
     return "\n".join((
         "# TOOL EXECUTION PROTOCOL",
         "",
-        "You are an execution-oriented software engineering agent.",
-        "When the task requires a local tool, you MUST emit a tool_call before continuing.",
-        "A tool_call is a request for the calling harness to execute the tool; it is not a tool result.",
+        "You have access to tools represented by the following deterministic command format.",
+        "A tool invocation MUST be emitted exactly as:",
+        '<tool_call> {',
+        '  "name": "<TOOL_NAME>",',
+        '  "input": {',
+        '    ...',
+        '  }',
+        '} </tool_call>',
         "",
-        "STRICT TOOL-CALL FORMAT:",
-        '<tool_call>{"name":"TOOL_NAME","input":{...}}</tool_call>',
+        "Do not describe a tool call in prose. Do not pretend a tool was executed.",
+        "Emit the tool_call first, then wait for the tool result.",
         "",
-        "Rules:",
-        "- Use only tools listed in <available_tools>.",
-        "- The name must exactly match a listed tool.",
-        "- The input object must conform exactly to that tool's input_schema.",
-        "- Emit the tool_call as the action itself; do not describe it in prose.",
-        "- After emitting a tool_call, stop and wait for the harness to return its result.",
-        "- Never fabricate a tool result.",
-        "- Never claim that a local file was read unless a tool result confirms it.",
-        "- Never say that local filesystem access is unavailable when a matching tool is listed.",
+        tools_section,
         "",
-        "EXECUTION SEQUENCE:",
-        "USER REQUEST -> SELECT TOOL -> EMIT tool_call -> WAIT FOR TOOL RESULT -> CONTINUE",
+        "# EXECUTION RULE",
+        "For every request requiring filesystem access:",
         "",
-        definitions,
+        "1. Determine the required tool.",
+        "2. Emit exactly one tool_call.",
+        "3. Wait for the tool result.",
+        "4. Continue using the returned result.",
+        "5. Emit another tool_call when another operation is required.",
+        "6. Only provide the final answer after the requested operation is actually completed.",
+        "",
+        "# CRITICAL RULE",
+        "If a requested operation can be performed by one of the tools above, you MUST attempt the tool call.",
+        "Never respond:",
+        "'I cannot access your filesystem.'",
+        "when the required tool is available through this protocol.",
+        "Never fabricate a tool result. Never fabricate file contents.",
+        "Never use your own bash terminal. Never claim a command was executed unless a corresponding tool result exists.",
+        "STRICT: FOLLOW THE SCHEMA ON HOW TO USE TOOL CALLING!",
+    ))
+    
+    # ── The exact protocol structure from your manual test ───────────────────
+    return "\n".join((
+        "# TOOL EXECUTION PROTOCOL",
+        "",
+        "You have access to tools represented by the following deterministic command format.",
+        "A tool invocation MUST be emitted exactly as:",
+        '<tool_call> {',
+        '  "name": "<TOOL_NAME>",',
+        '  "input": {',
+        '    ...',
+        '  }',
+        '} </tool_call>',
+        "",
+        "Do not describe a tool call in prose. Do not pretend a tool was executed.",
+        "Emit the tool_call first, then wait for the tool result.",
+        "",
+        tools_section,
+        "",
+        "# EXECUTION RULE",
+        "For every request requiring filesystem access:",
+        "",
+        "1. Determine the required tool.",
+        "2. Emit exactly one tool_call.",
+        "3. Wait for the tool result.",
+        "4. Continue using the returned result.",
+        "5. Emit another tool_call when another operation is required.",
+        "6. Only provide the final answer after the requested operation is actually completed.",
+        "",
+        "# CRITICAL RULE",
+        "If a requested operation can be performed by one of the tools above, you MUST attempt the tool call.",
+        "Never respond:",
+        "'I cannot access your filesystem.'",
+        "when the required tool is available through this protocol.",
+        "Never fabricate a tool result. Never fabricate file contents.",
+        "Never use your own bash terminal. Never claim a command was executed unless a corresponding tool result exists.",
+        "STRICT: FOLLOW THE SCHEMA ON HOW TO USE TOOL CALLING!",
     ))
 
 def _compile_tool_definitions_for_model(tools: Optional[List[dict]]) -> str:
@@ -1109,19 +1228,33 @@ def _tool_continuation_prompt(req: AntRequest) -> str:
     return "\n\n".join(parts) + "\n\nAssistant:"
 
 
+
 def _ant_build_prompt(req: AntRequest) -> str:
     """
     Assemble the Claude web-API prompt string from an Anthropic Messages request.
 
-    System prompt priority:
-      1. Top-level `system` field  (Claude Code always uses this)
-      2. A message with role="system" in the messages list  (legacy fallback)
+    PRIORITY ORDER (highest to lowest):
+      1. TOOL EXECUTION PROTOCOL — must dominate to override web model identity
+      2. SYSTEM CONTEXT — Claude Code's original system prompt (preserved verbatim)
+      3. CONVERSATION — message history with tool_use/tool_result preservation
 
-    Prompt format matches what _stream_on_slot() expects — same as oai_chat.
+    The tool protocol is placed FIRST because the web model's internal system
+    prompt anchors "I am Claude on claude.ai, I have no tools." Our protocol
+    must override that before the model processes any other context.
     """
     parts: list[str] = []
 
-    # 1. System prompt
+    # PRIORITY 1: TOOL EXECUTION PROTOCOL
+    # This must come FIRST to override the model's default "I am web Claude"
+    # identity. The protocol is a deterministic technical contract, not a roleplay.
+    if req.tools:
+        protocol = _build_model_tool_protocol(req.tools)
+        if protocol:
+            parts.append(protocol)
+
+    # PRIORITY 2: SYSTEM CONTEXT
+    # Preserve Claude Code's original system prompt verbatim.
+    # It contains project-specific instructions, coding standards, memories, etc.
     system_text: Optional[str] = None
     if req.system:
         system_text = _ant_extract_text(req.system).strip()
@@ -1131,50 +1264,50 @@ def _ant_build_prompt(req: AntRequest) -> str:
                 system_text = _ant_extract_text(m.content).strip()
                 break
 
-    if system_text or req.tools:
-        system_parts: list[str] = []
+    if system_text:
+        # Separate from protocol with a clear boundary so the model sees them
+        # as distinct instruction layers.
+        parts.append(f"# SYSTEM CONTEXT\n\n{system_text}")
 
-        if req.tools:
-            system_parts.append(_build_model_tool_protocol(req.tools))
-
-        if system_text:
-            system_parts.append(system_text)
-
-        compiled_system = "\n\n".join(p for p in system_parts if p)
-        parts.append(f"<s>\n{compiled_system}\n</s>")
-
-    # 2. Conversation turns (skip system role — already handled above).
-    # Tool-result blocks are preserved as structured state and compiled into a
-    # model-facing text representation instead of being discarded by the old
-    # text extractor.
+    # PRIORITY 3: CONVERSATION HISTORY
+    # Translate Anthropic content blocks -> Human/Assistant text format.
+    # CRITICAL: Preserve tool_use and tool_result blocks as structured markers
+    # so the model sees the full multi-turn context.
     for m in req.messages:
         if m.role == "system":
-            continue
+            continue  # Already handled above
 
+        # Render assistant's previous tool_use calls (from prior turns)
         tool_uses = _compile_tool_uses_for_model(m.content)
         if tool_uses:
-            parts.append(f"\n\nAssistant: {tool_uses}")
+            parts.append("\n\nAssistant: " + tool_uses)
 
+        # Render tool_results from Claude Code's local execution
         tool_results = extract_tool_results(m.content)
         if tool_results:
             rendered = compile_tool_results_for_model(tool_results)
-            parts.append(f"\n\nHuman: {rendered}")
+            parts.append("\n\nHuman: " + rendered)
 
-        text = _ant_extract_text(m.content)
+        # Render plain text
+        text = _ant_extract_text(m.content).strip()
         if text:
             if m.role == "user":
-                parts.append(f"\n\nHuman: {text}")
+                parts.append("\n\nHuman: " + text)
             elif m.role == "assistant":
-                parts.append(f"\n\nAssistant: {text}")
+                parts.append("\n\nAssistant: " + text)
 
-    # 3. Trailing assistant turn marker (only when last non-system turn is from user)
+    # TURN MARKER
+    # Only append trailing Assistant: marker when the last non-system turn is
+    # from the user. If the last turn was an assistant tool_use, we want
+    # continuation, not a new turn.
     last_non_sys = next(
         (m for m in reversed(req.messages) if m.role != "system"), None
     )
     if last_non_sys is None or last_non_sys.role == "user":
         parts.append("\n\nAssistant:")
 
-    return "".join(parts)
+    return "\n\n".join(parts)
+
 
 def _probe_tool_stream(model: str, msg_id: str):
     def evt(event: str, data: dict) -> str:
