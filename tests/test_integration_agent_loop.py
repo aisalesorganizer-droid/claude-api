@@ -113,9 +113,9 @@ def test_full_two_request_read_loop(monkeypatch):
     second_response = __import__("asyncio").run(main.ant_messages(FakeRequest(second), None))
     second_events = __import__("asyncio").run(_decode_sse(second_response))
 
-    assert any("<tool_use>" in upstream_prompts[1] for _ in [0])
+    assert '"tool":"Read"' in upstream_prompts[1]
     assert tool_id in upstream_prompts[1]
-    assert '"name":"Read"' in upstream_prompts[1]
+    assert '"parameters"' in upstream_prompts[1]
     assert "<tool_result>" in upstream_prompts[1]
     assert "PROTOCOL_PROBE_SUCCESS" in upstream_prompts[1]
     assert upstream_states[0] is upstream_states[1]
