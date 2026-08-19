@@ -37,8 +37,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Generator, Iterable
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, Depends
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ─── Account loading from env ─────────────────────────────────────────────────
@@ -251,6 +251,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="claude-api", lifespan=lifespan)
 
+
+@app.get("/__debug/compiled-prompt")
+def debug_compiled_prompt(
+    x_debug_token: str | None = Header(default=None),
+):
+    expected = os.getenv("DEBUG_PROMPT_TOKEN")
+
+    if not expected or x_debug_token != expected:
+        raise HTTPException(status_code=404)
+
+    path = "/tmp/compiled_prompt.txt"
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404)
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    return PlainTextResponse(content)
+
+
+# ─── Auth guard ─────────────────────────────────────────────────────────────
 
 # ─── Auth guard ───────────────────────────────────────────────────────────────
 
