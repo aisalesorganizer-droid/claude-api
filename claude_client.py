@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import os, sys, json, time, socket, datetime, argparse, uuid as _uuid, base64
 from pathlib import Path
+
+from anthropic_protocol.models import StreamEvent
+from anthropic_protocol.streaming import parse_sse_lines
 from typing import Optional, Tuple, Dict, List, Generator
 
 # ─── Lazy imports (safe for server import) ──────────────────────────────────
@@ -466,33 +469,38 @@ def _get_slot_state(slot: str, proxy: Optional[str]) -> _SlotState:
     return _slot_states[slot]
 
 
-def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
-                    file_attachments: Optional[List[dict]] = None) -> Generator[str, None, None]:
-    """Send prompt on the given slot state. Yields text chunks."""
+def _stream_events_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
+                           file_attachments: Optional[List[dict]] = None) -> Iterator[StreamEvent]:
+    """Send a prompt and yield structured Claude.ai stream events.
+
+    This is the canonical upstream representation for the protocol bridge.
+    The legacy text-only API is implemented as a wrapper below so existing
+    OpenAI/chat callers continue to work during the migration.
+    """
     slot = state.slot
-    s    = state.http
+    s = state.http
 
     real_model, thinking_mode, effort = resolve_model(model)
 
     if state.conv_id is None:
-        state.conv_id       = create_conversation(s, state.org_id, state.device_id, real_model)
+        state.conv_id = create_conversation(s, state.org_id, state.device_id, real_model)
         state.last_asst_uuid = None
 
     human_uuid = uuid7()
-    asst_uuid  = uuid7()
+    asst_uuid = uuid7()
 
     body: dict = {
-        "prompt":             prompt,
-        "timezone":           os.environ.get("ZAI_TIMEZONE", "Asia/Taipei"),
-        "locale":             "en-US",
-        "model":              real_model,
-        "thinking_mode":      thinking_mode,
-        "attachments":        file_attachments or [],
-        "files":              [],
-        "sync_sources":       [],
-        "rendering_mode":     "messages",
+        "prompt": prompt,
+        "timezone": os.environ.get("ZAI_TIMEZONE", "Asia/Taipei"),
+        "locale": "en-US",
+        "model": real_model,
+        "thinking_mode": thinking_mode,
+        "attachments": file_attachments or [],
+        "files": [],
+        "sync_sources": [],
+        "rendering_mode": "messages",
         "turn_message_uuids": {
-            "human_message_uuid":     human_uuid,
+            "human_message_uuid": human_uuid,
             "assistant_message_uuid": asst_uuid,
         },
     }
@@ -501,13 +509,16 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     if state.last_asst_uuid:
         body["parent_message_uuid"] = state.last_asst_uuid
 
-    referer = "{}/chat/{}".format(BASE_URL, state.conv_id) if state.last_asst_uuid else BASE_URL + "/new"
-
+    referer = (
+        "{}/chat/{}".format(BASE_URL, state.conv_id)
+        if state.last_asst_uuid
+        else BASE_URL + "/new"
+    )
     headers = {
-        "accept":                    "text/event-stream",
-        "content-type":              "application/json",
-        "anthropic-device-id":       state.device_id,
-        "referer":                   referer,
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+        "anthropic-device-id": state.device_id,
+        "referer": referer,
     }
     if state.anonymous_id:
         headers["anthropic-anonymous-id"] = state.anonymous_id
@@ -515,7 +526,6 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     url = BASE_URL + "/api/organizations/{}/chat_conversations/{}/completion".format(
         state.org_id, state.conv_id
     )
-
     r = s.post(url, json=body, headers=headers, stream=True, timeout=120)
     print("[{}][completion] HTTP {}".format(slot, r.status_code), file=sys.stderr)
 
@@ -523,78 +533,60 @@ def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
         clear_slot_session(slot)
         _slot_states.pop(slot, None)
         raise RuntimeError("[{}] 401 — session expired, cleared".format(slot))
-
     if r.status_code == 429:
         raise RuntimeError("[{}] 429 — rate limited".format(slot))
-
     if r.status_code != 200:
         raise RuntimeError("[{}] HTTP {} {}".format(slot, r.status_code, r.text[:300]))
 
-    chunks = []
     got_content = False
     got_thinking = False
+    got_tool = False
+    saw_message_stop = False
 
-    for raw in r.iter_lines():
-        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    for event in parse_sse_lines(r.iter_lines()):
         if SSE_DEBUG:
-            print("[SSE] {!r}".format(line), file=sys.stderr)
-        if not line or line.startswith("event:"):
-            continue
-        if not line.startswith("data:"):
-            continue
-        data_str = line[5:].strip()
-        if not data_str:
-            continue
-        try:
-            evt = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+            print("[SSE EVENT] {}".format(event.raw), file=sys.stderr)
 
-        etype = evt.get("type")
-
-        if etype == "content_block_delta":
-            delta = evt.get("delta", {})
-            dtype = delta.get("type")
-            if dtype == "text_delta":
-                chunk = delta.get("text", "")
-                if chunk:
-                    chunks.append(chunk)
-                    got_content = True
-                    yield chunk
-            elif dtype == "thinking_delta":
+        if event.type == "content_block_start" and event.block is not None:
+            if event.block.type == "tool_use":
+                got_tool = True
+        elif event.type == "content_block_delta":
+            if event.delta_type == "text_delta" and event.text:
+                got_content = True
+            elif event.delta_type == "thinking_delta":
                 got_thinking = True
+            elif event.delta_type == "input_json_delta":
+                got_tool = True
+        elif event.type == "message_stop":
+            saw_message_stop = True
 
-        elif etype == "message_stop":
-            # FIX: If model thought but produced no text, reset conversation state
-            # to avoid poisoning the parent_message_uuid chain with an empty turn.
-            if not got_content and not got_thinking:
-                state.conv_id        = None
-                state.last_asst_uuid = None
-                raise RuntimeError("[{}] message_stop with no content — session may be expired".format(slot))
-            if not got_content and got_thinking:
-                # Thinking-only response: reset state so next turn starts fresh
-                state.conv_id        = None
-                state.last_asst_uuid = None
-                return
-            state.last_asst_uuid = asst_uuid
-            return
+        yield event
 
-        elif etype == "message_limit":
-            ml = evt.get("message_limit", {})
+        if event.type == "error":
+            raise RuntimeError("[{}] API error: {}".format(
+                slot, event.error_message or str(event.raw)
+            ))
+        if event.type == "message_limit":
+            ml = event.raw.get("message_limit", {})
             if ml.get("type") == "exceeded_limit":
                 raise RuntimeError("[{}] message limit exceeded".format(slot))
 
-        elif etype == "error":
-            err = evt.get("error", {})
-            raise RuntimeError("[{}] API error: {}".format(slot, err.get("message", str(err))))
-
-    if chunks:
+    # A structured turn may legally contain tool_use without visible text.
+    if saw_message_stop and (got_content or got_thinking or got_tool):
         state.last_asst_uuid = asst_uuid
         return
 
-    state.conv_id        = None
+    state.conv_id = None
     state.last_asst_uuid = None
-    raise RuntimeError("[{}] SSE stream closed with no content".format(slot))
+    raise RuntimeError("[{}] SSE stream closed with no usable content".format(slot))
+
+
+def _stream_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
+                    file_attachments: Optional[List[dict]] = None) -> Generator[str, None, None]:
+    """Legacy text-only wrapper over the structured upstream event stream."""
+    for event in _stream_events_on_slot(state, prompt, model, file_attachments):
+        if event.type == "content_block_delta" and event.delta_type == "text_delta" and event.text:
+            yield event.text
 
 
 def send(prompt: str, proxy: Optional[str] = None, model: str = MODEL,

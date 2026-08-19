@@ -35,7 +35,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Generator
+from typing import Dict, List, Optional, Generator, Iterable
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends
 from fastapi.responses import StreamingResponse
@@ -98,10 +98,19 @@ import claude_client as _cc_module
 _cc_module.POOL_DIR = _tmpdir
 
 from claude_client import (
-    _make_curl_session, create_conversation, _stream_on_slot, _SlotState,
+    _make_curl_session, create_conversation, _stream_on_slot, _stream_events_on_slot, _SlotState,
     upload_file, list_accounts, load_slot_session, ensure_slot,
     BASE_URL, MODEL, CURL_AVAILABLE, MODEL_CONFIGS, resolve_model
 )
+from anthropic_protocol.models import StreamEvent, ToolDefinition
+from agent_bridge.tool_results import (extract_tool_results, compile_tool_results_for_model, resolve_tool_results, ToolResultError)
+from agent_bridge.tool_registry import ToolRegistry, ToolRegistryError
+from agent_bridge.tool_parser import extract_tool_calls, ToolCallParseError
+from agent_bridge.session import AgentSessionStore
+from anthropic_protocol.response import AnthropicResponseCompiler
+
+# Logical Claude Code sessions span multiple /v1/messages calls during tool loops.
+agent_session_store = AgentSessionStore()
 
 # ─── Supported models ─────────────────────────────────────────────────────────
 
@@ -350,6 +359,69 @@ def _stream_claude(prompt: str, model: str, file_attachments: Optional[List[dict
             if "403" in err_msg or "Just a moment" in err_msg or "cloudflare" in err_msg.lower():
                 print(f"[stream] {acc.label} blocked by Cloudflare challenge (403). "
                       f"cf_clearance may be stale or IP-mismatched.", flush=True)
+                continue
+            raise
+
+    raise RuntimeError("All Claude accounts failed after full rotation.")
+
+
+def _stream_claude_events(prompt: str, model: str, file_attachments: Optional[List[dict]] = None,
+                          forced_label: Optional[str] = None) -> Generator[StreamEvent, None, None]:
+    """Yield structured upstream events with the same account-rotation policy as text streaming."""
+    n = len(_account_objects)
+    if n == 0:
+        raise RuntimeError("No accounts available")
+
+    tried: set[str] = set()
+
+    def _try_account(acc: _ClaudeAccount):
+        state = _fresh_slot_state(acc.label)
+        for event in _stream_events_on_slot(state, prompt, model, file_attachments):
+            yield event
+        acc.mark_success()
+
+    if forced_label:
+        acc = next((a for a in _account_objects if a.label == forced_label), None)
+        if acc and acc.is_healthy:
+            tried.add(acc.label)
+            try:
+                yield from _try_account(acc)
+                return
+            except RuntimeError as e:
+                err_msg = str(e)
+                print(f"[stream-events] {acc.label} failed: {err_msg}", flush=True)
+                acc.mark_failure()
+                if "429" in err_msg:
+                    time.sleep(2)
+                elif "overloaded" in err_msg.lower() or "temporarily" in err_msg.lower():
+                    time.sleep(3)
+                elif "403" in err_msg:
+                    time.sleep(2)
+                elif "401" not in err_msg and "expired" not in err_msg.lower():
+                    raise
+
+    for _ in range(n):
+        acc = _next_healthy_account()
+        if acc is None or acc.label in tried:
+            continue
+        tried.add(acc.label)
+        try:
+            yield from _try_account(acc)
+            return
+        except RuntimeError as e:
+            err_msg = str(e)
+            print(f"[stream-events] {acc.label} failed: {err_msg}", flush=True)
+            acc.mark_failure()
+            if "429" in err_msg:
+                time.sleep(2)
+                continue
+            if "overloaded" in err_msg.lower() or "temporarily" in err_msg.lower():
+                time.sleep(3)
+                continue
+            if "403" in err_msg or "Just a moment" in err_msg or "cloudflare" in err_msg.lower():
+                time.sleep(2)
+                continue
+            if "401" in err_msg or "expired" in err_msg.lower():
                 continue
             raise
 
@@ -929,6 +1001,77 @@ def _ant_extract_text(content) -> str:
     return str(content)
 
 
+def _compile_tool_definitions_for_model(tools: Optional[List[dict]]) -> str:
+    if not tools:
+        return ""
+    lines = [
+        "<available_tools>",
+        "You may request local Claude Code tools using the exact format:",
+        '<tool_call>{"name":"<tool name>","input":{...}}</tool_call>',
+        "Only use a tool that appears below and make input conform exactly to its JSON schema.",
+    ]
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        description = tool.get("description") if isinstance(tool.get("description"), str) else ""
+        schema = tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {}
+        lines.extend([
+            "<tool>",
+            f"<name>{name}</name>",
+            f"<description>{description}</description>",
+            "<input_schema>",
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            "</input_schema>",
+            "</tool>",
+        ])
+    lines.append("</available_tools>")
+    return "\n".join(lines)
+
+
+def _compile_tool_uses_for_model(content) -> str:
+    """Render assistant tool_use blocks so the text backend sees the call context."""
+    if not isinstance(content, list):
+        return ""
+    rendered: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        payload = {
+            "tool_use_id": block.get("id"),
+            "name": block.get("name"),
+            "input": block.get("input", {}),
+        }
+        rendered.append(
+            "<tool_use>\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n</tool_use>"
+        )
+    return "\n\n".join(rendered)
+
+
+def _tool_continuation_prompt(req: AntRequest) -> str:
+    parts: list[str] = []
+    for message in req.messages:
+        tool_uses = _compile_tool_uses_for_model(message.content)
+        if tool_uses:
+            parts.append("Assistant: " + tool_uses)
+
+        results = extract_tool_results(message.content)
+        if results:
+            parts.append("Human: " + compile_tool_results_for_model(results))
+            continue
+
+        text = _ant_extract_text(message.content).strip()
+        if text:
+            role = "Human" if message.role == "user" else "Assistant"
+            parts.append(f"{role}: {text}")
+
+    return "\n\n".join(parts) + "\n\nAssistant:"
+
+
 def _ant_build_prompt(req: AntRequest) -> str:
     """
     Assemble the Claude web-API prompt string from an Anthropic Messages request.
@@ -954,15 +1097,33 @@ def _ant_build_prompt(req: AntRequest) -> str:
     if system_text:
         parts.append(f"<s>\n{system_text}\n</s>")
 
-    # 2. Conversation turns (skip system role — already handled above)
+    tool_instructions = _compile_tool_definitions_for_model(req.tools)
+    if tool_instructions:
+        parts.append("\n\n" + tool_instructions)
+
+    # 2. Conversation turns (skip system role — already handled above).
+    # Tool-result blocks are preserved as structured state and compiled into a
+    # model-facing text representation instead of being discarded by the old
+    # text extractor.
     for m in req.messages:
         if m.role == "system":
             continue
+
+        tool_uses = _compile_tool_uses_for_model(m.content)
+        if tool_uses:
+            parts.append(f"\n\nAssistant: {tool_uses}")
+
+        tool_results = extract_tool_results(m.content)
+        if tool_results:
+            rendered = compile_tool_results_for_model(tool_results)
+            parts.append(f"\n\nHuman: {rendered}")
+
         text = _ant_extract_text(m.content)
-        if m.role == "user":
-            parts.append(f"\n\nHuman: {text}")
-        elif m.role == "assistant":
-            parts.append(f"\n\nAssistant: {text}")
+        if text:
+            if m.role == "user":
+                parts.append(f"\n\nHuman: {text}")
+            elif m.role == "assistant":
+                parts.append(f"\n\nAssistant: {text}")
 
     # 3. Trailing assistant turn marker (only when last non-system turn is from user)
     last_non_sys = next(
@@ -1255,55 +1416,93 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
 
     # ── Streaming ──────────────────────────────────────────────────────────────
     if req.stream:
+        session_id = request.headers.get("x-claude-code-session-id")
+        if not session_id and isinstance(req.metadata, dict):
+            session_id = req.metadata.get("user_id")
+        session_id = session_id or f"anonymous:{request.client.host if request.client else 'unknown'}"
+        session = agent_session_store.get(str(session_id))
+
         def stream_generator():
-            import queue as _queue
-            q     = _queue.Queue()
-            done  = threading.Event()
-            error_holder: list[Optional[Exception]] = [None]
+            try:
+                if req.tools:
+                    session.registry = ToolRegistry()
+                    definitions = []
+                    for tool in req.tools:
+                        if not isinstance(tool, dict):
+                            continue
+                        definitions.append(ToolDefinition(
+                            name=tool.get("name", ""),
+                            description=tool.get("description", ""),
+                            input_schema=tool.get("input_schema", {}),
+                            raw=tool,
+                        ))
+                    session.registry.register_many(definitions)
 
-            def _run_in_thread():
-                try:
-                    for evt in _to_ant_stream(
-                        _stream_claude(prompt, model, None, None),
-                        model,
-                        msg_id,
-                    ):
-                        q.put(evt)
-                except Exception as exc:
-                    error_holder[0] = exc
-                finally:
-                    done.set()
+                incoming_results = []
+                for message in req.messages:
+                    incoming_results.extend(extract_tool_results(message.content))
 
-            t = threading.Thread(target=_run_in_thread, daemon=True)
-            t.start()
-
-            while not done.is_set() or not q.empty():
-                try:
-                    yield q.get(timeout=0.1)
-                except _queue.Empty:
-                    if done.is_set():
-                        break
-
-            t.join(timeout=5)
-
-            if error_holder[0]:
-                err = str(error_holder[0])
-                print(f"[ant stream] ERROR: {err}")
-                if "expired" in err.lower() or "401" in err:
-                    yield _ant_error_event(f"Session expired: {err}", "authentication_error")
-                elif "429" in err:
-                    yield _ant_error_event("Rate limited. Try again later.", "rate_limit_error")
-                elif "overloaded" in err.lower():
-                    yield _ant_error_event("Claude is overloaded. Try again shortly.", "overloaded_error")
+                if incoming_results:
+                    resolve_tool_results(session.state, incoming_results)
+                    prompt_for_model = _tool_continuation_prompt(req)
                 else:
-                    yield _ant_error_event(err, "server_error")
+                    prompt_for_model = prompt
+
+                if session.upstream_state is None:
+                    account = _next_healthy_account()
+                    if account is None:
+                        raise RuntimeError("No healthy Claude account available for agent session")
+                    session.account_label = account.label
+                    session.upstream_state = _fresh_slot_state(account.label)
+                    session.state.account_id = account.label
+
+                session.turns += 1
+                events = list(_stream_events_on_slot(session.upstream_state, prompt_for_model, model, None))
+                text = "".join(
+                    event.text or ""
+                    for event in events
+                    if event.type == "content_block_delta" and event.delta_type == "text_delta"
+                )
+
+                parsed_calls = extract_tool_calls(text)
+                if parsed_calls:
+                    invocations = []
+                    prefix_parts = []
+                    cursor = 0
+                    for parsed in parsed_calls:
+                        if parsed.start > cursor:
+                            prefix_parts.append(text[cursor:parsed.start])
+                        tool_id = f"toolu_{uuid.uuid4().hex[:20]}"
+                        invocation = session.registry.build_invocation(parsed, tool_id)
+                        session.state.register_invocation(invocation)
+                        invocations.append(invocation)
+                        cursor = parsed.end
+                    if cursor < len(text):
+                        prefix_parts.append(text[cursor:])
+                    compiler = AnthropicResponseCompiler(model=model, message_id=msg_id)
+                    source = compiler.compile_tool_turn(invocations, prefix_text="".join(prefix_parts).strip())
+                    yield from _capture_ant_stream(source, protocol_request_id)
+                    return
+
+                compiler = AnthropicResponseCompiler(model=model, message_id=msg_id)
+                source = compiler.compile(events)
+                yield from _capture_ant_stream(source, protocol_request_id)
+                if not session.state.has_pending_tools():
+                    agent_session_store.pop(str(session_id))
+            except (ToolRegistryError, ToolCallParseError, ToolResultError, KeyError, ValueError) as exc:
+                yield _ant_error_event(str(exc), "invalid_request_error")
+                agent_session_store.pop(str(session_id))
+            except Exception as exc:
+                print(f"[agent-loop] ERROR: {exc}", file=sys.stderr, flush=True)
+                yield _ant_error_event(str(exc), "server_error")
+                agent_session_store.pop(str(session_id))
 
         return StreamingResponse(
-            _capture_ant_stream(stream_generator(), protocol_request_id),
+            stream_generator(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control":   "no-cache",
-                "X-Accel-Buffering": "no",       # disable nginx buffering on Railway
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
             },
         )
 

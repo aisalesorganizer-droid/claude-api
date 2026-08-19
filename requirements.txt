@@ -3,3 +3,4 @@ uvicorn[standard]
 pydantic
 curl_cffi
 python-multipart
+jsonschema
