@@ -1394,12 +1394,13 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
     prompt = _ant_build_prompt(req)
 
     if os.getenv("CAPTURE_COMPILED_PROMPT") == "1":
-        import base64
-        encoded_prompt = base64.b64encode(
-            prompt.encode("utf-8")
-        ).decode("ascii")
+        capture_path = "/tmp/compiled_prompt.txt"
 
-        print(f"COMPILED_PROMPT_B64={encoded_prompt}")
+        with open(capture_path, "w", encoding="utf-8") as f:
+            f.write(prompt)
+
+        print(f"COMPILED_PROMPT_FILE={capture_path}", file=sys.stderr)
+        print(f"COMPILED_PROMPT_LENGTH={len(prompt)}", file=sys.stderr)
 
     last_user = next(
         (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
