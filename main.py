@@ -1393,6 +1393,11 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
     # Build the Claude web-API prompt
     prompt = _ant_build_prompt(req)
 
+    if os.getenv("CAPTURE_COMPILED_PROMPT") == "1":
+        print("\n========== COMPILED PROMPT START ==========")
+        print(prompt)
+        print("========== COMPILED PROMPT END ==========\n")
+
     last_user = next(
         (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
         "",
