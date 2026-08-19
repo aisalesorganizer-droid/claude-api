@@ -526,8 +526,87 @@ def _stream_events_on_slot(state: _SlotState, prompt: str, model: str = MODEL,
     url = BASE_URL + "/api/organizations/{}/chat_conversations/{}/completion".format(
         state.org_id, state.conv_id
     )
+    
     r = s.post(url, json=body, headers=headers, stream=True, timeout=120)
     print("[{}][completion] HTTP {}".format(slot, r.status_code), file=sys.stderr)
+
+    capture_upstream = os.getenv("CAPTURE_UPSTREAM_RESPONSE") == "1"
+    capture_lines: list[bytes] = []
+
+    def captured_lines():
+        for line in r.iter_lines():
+            if capture_upstream:
+                if isinstance(line, str):
+                    capture_lines.append(line.encode("utf-8"))
+                else:
+                    capture_lines.append(line)
+            yield line
+
+    if r.status_code == 401:
+        clear_slot_session(slot)
+        _slot_states.pop(slot, None)
+        raise RuntimeError("[{}] 401 — session expired, cleared".format(slot))
+
+    if r.status_code == 429:
+        raise RuntimeError("[{}] 429 — rate limited".format(slot))
+
+    if r.status_code != 200:
+        raise RuntimeError("[{}] HTTP {} {}".format(slot, r.status_code, r.text[:300]))
+
+    got_content = False
+    got_thinking = False
+    got_tool = False
+    saw_message_stop = False
+
+    for event in parse_sse_lines(captured_lines()):
+        if SSE_DEBUG:
+            print("[SSE EVENT] {}".format(event.raw), file=sys.stderr)
+
+        if event.type == "content_block_start" and event.block is not None:
+            if event.block.type == "tool_use":
+                got_tool = True
+
+        elif event.type == "content_block_delta":
+            if event.delta_type == "text_delta" and event.text:
+                got_content = True
+            elif event.delta_type == "thinking_delta":
+                got_thinking = True
+            elif event.delta_type == "input_json_delta":
+                got_tool = True
+
+        elif event.type == "message_stop":
+            saw_message_stop = True
+
+        yield event
+
+        if event.type == "error":
+            raise RuntimeError(
+                "[{}] API error: {}".format(
+                    slot,
+                    event.error_message or str(event.raw),
+                )
+            )
+
+        if event.type == "message_limit":
+            ml = event.raw.get("message_limit", {})
+            if ml.get("type") == "exceeded_limit":
+                raise RuntimeError("[{}] message limit exceeded".format(slot))
+
+    if capture_upstream:
+        raw_body = b"\n".join(capture_lines)
+        print(
+            "UPSTREAM_RAW_B64="
+            + base64.b64encode(raw_body).decode("ascii"),
+            file=sys.stderr,
+        )
+
+    if saw_message_stop and (got_content or got_thinking or got_tool):
+        state.last_asst_uuid = asst_uuid
+        return
+
+    state.conv_id = None
+    state.last_asst_uuid = None
+    raise RuntimeError("[{}] SSE stream closed with no usable content".format(slot))
 
     if r.status_code == 401:
         clear_slot_session(slot)
