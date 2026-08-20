@@ -1056,9 +1056,13 @@ def _build_model_tool_protocol(tools: Optional[List[dict]]) -> str:
     schemas_section = "\n\n".join(tool_docs)
 
     # Build compact examples for the first tool
-    first_tool = tools[0] if tools else {}
-    first_name = first_tool.get("name", "Read") if isinstance(first_tool, dict) else "Read"
-    first_schema = first_tool.get("input_schema", {}) if isinstance(first_tool, dict) else {}
+    # Build compact examples — always use Read as canonical example, not whatever tool arrives first.
+    read_tool = next(
+        (t for t in tools if isinstance(t, dict) and t.get("name") == "Read"),
+        tools[0] if tools else {},
+    )
+    first_name = read_tool.get("name", "Read") if isinstance(read_tool, dict) else "Read"
+    first_schema = read_tool.get("input_schema", {}) if isinstance(read_tool, dict) else {}
     first_example = _build_example_from_schema(first_schema)
     first_compact = json.dumps(
         {"tool": first_name, "parameters": first_example},
@@ -1240,8 +1244,8 @@ def _ant_build_prompt(req: AntRequest) -> str:
                 system_text = _ant_extract_text(m.content).strip()
                 break
 
-    # AFTER
-    if system_text and not req.tools:
+    # AFTER — formatter protocol and system context serve different purposes; always inject both.
+    if system_text:
         parts.append(f"# SYSTEM CONTEXT\n\n{system_text}")
 
     # PRIORITY 3: Conversation history
