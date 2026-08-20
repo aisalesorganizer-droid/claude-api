@@ -109,6 +109,15 @@ def extract_tool_calls(text: str) -> list[ParsedToolCall]:
     """
     if not text:
         return []
+        
+    # Strip markdown code fences and re-inject as <tool_call> blocks so Phase 1 catches them.
+    # The model sometimes wraps tool JSON in ```json ... ``` despite instructions not to.
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    for match in fenced:
+        text = text.replace(f"```json\n{match}\n```", f"<tool_call>{match}</tool_call>", 1)
+        text = text.replace(f"```\n{match}\n```", f"<tool_call>{match}</tool_call>", 1)
+        text = text.replace(f"```json{match}```", f"<tool_call>{match}</tool_call>", 1)
+        text = text.replace(f"```{match}```", f"<tool_call>{match}</tool_call>", 1)
 
     calls: list[ParsedToolCall] = []
 
