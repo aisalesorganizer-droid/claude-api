@@ -1204,14 +1204,26 @@ def _tool_continuation_prompt(req: AntRequest) -> str:
         if protocol:
             parts.append(protocol)
 
+    # Inject system context — same as _ant_build_prompt does on turn 1.
+    system_text: Optional[str] = None
+    if req.system:
+        system_text = _ant_extract_text(req.system).strip()
+    else:
+        for m in req.messages:
+            if m.role == "system":
+                system_text = _ant_extract_text(m.content).strip()
+                break
+    if system_text:
+        parts.append(f"# SYSTEM CONTEXT\n\n{system_text}")
+
     for message in req.messages:
         tool_uses = _compile_tool_uses_for_model(message.content)
         if tool_uses:
             parts.append("Assistant: " + tool_uses)
+            continue
 
         results = extract_tool_results(message.content)
         if results:
-            rendered = []
             rendered = compile_tool_results_for_model(results)
             parts.append("Human: " + rendered)
             continue
