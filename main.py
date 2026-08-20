@@ -105,7 +105,7 @@ from claude_client import (
 from anthropic_protocol.models import StreamEvent, ToolDefinition
 from agent_bridge.tool_results import (extract_tool_results, compile_tool_results_for_model, resolve_tool_results, ToolResultError)
 from agent_bridge.tool_registry import ToolRegistry, ToolRegistryError
-from agent_bridge.tool_parser import extract_tool_calls, ToolCallParseError
+from agent_bridge.tool_parser import ToolCallParseError, extract_tool_calls
 from agent_bridge.session import AgentSessionStore
 from anthropic_protocol.response import AnthropicResponseCompiler
 
@@ -1001,28 +1001,6 @@ def _ant_extract_text(content) -> str:
     return str(content)
 
 
-def _build_example_from_schema(schema: dict) -> dict:
-    """Generate a minimal valid example object from a JSON schema."""
-    example: dict = {}
-    properties = schema.get("properties", {})
-    for key, prop in properties.items():
-        ptype = prop.get("type")
-        if ptype == "string":
-            example[key] = f"<{key}>"
-        elif ptype == "boolean":
-            example[key] = False
-        elif ptype == "integer":
-            example[key] = 0
-        elif ptype == "number":
-            example[key] = 0.0
-        elif ptype == "array":
-            example[key] = []
-        elif ptype == "object":
-            example[key] = {}
-        else:
-            example[key] = None
-    return example
-
 
 def _build_example_from_schema(schema: dict) -> dict:
     """Generate a minimal valid example object from a JSON schema."""
@@ -1148,43 +1126,6 @@ def _build_model_tool_protocol(tools: Optional[List[dict]]) -> str:
         "════════════════════════════════════════════",
     ))
     
-    # ── The exact protocol structure from your manual test ───────────────────
-    return "\n".join((
-        "# TOOL EXECUTION PROTOCOL",
-        "",
-        "You have access to tools represented by the following deterministic command format.",
-        "A tool invocation MUST be emitted exactly as:",
-        '<tool_call> {',
-        '  "name": "<TOOL_NAME>",',
-        '  "input": {',
-        '    ...',
-        '  }',
-        '} </tool_call>',
-        "",
-        "Do not describe a tool call in prose. Do not pretend a tool was executed.",
-        "Emit the tool_call first, then wait for the tool result.",
-        "",
-        tools_section,
-        "",
-        "# EXECUTION RULE",
-        "For every request requiring filesystem access:",
-        "",
-        "1. Determine the required tool.",
-        "2. Emit exactly one tool_call.",
-        "3. Wait for the tool result.",
-        "4. Continue using the returned result.",
-        "5. Emit another tool_call when another operation is required.",
-        "6. Only provide the final answer after the requested operation is actually completed.",
-        "",
-        "# CRITICAL RULE",
-        "If a requested operation can be performed by one of the tools above, you MUST attempt the tool call.",
-        "Never respond:",
-        "'I cannot access your filesystem.'",
-        "when the required tool is available through this protocol.",
-        "Never fabricate a tool result. Never fabricate file contents.",
-        "Never use your own bash terminal. Never claim a command was executed unless a corresponding tool result exists.",
-        "STRICT: FOLLOW THE SCHEMA ON HOW TO USE TOOL CALLING!",
-    ))
 
 def _compile_tool_definitions_for_model(tools: Optional[List[dict]]) -> str:
     if not tools:
@@ -1226,7 +1167,7 @@ def _compile_tool_uses_for_model(content: Any) -> str:
                 inp = block.get("input", {})
                 uses.append(
                     json.dumps(
-                        {"tool": name, "parameters": inp},
+                        {"tool": name, "parameters": inp, "id": block.get("id", "")},
                         ensure_ascii=False,
                         separators=(",", ":"),
                     )
@@ -1236,7 +1177,7 @@ def _compile_tool_uses_for_model(content: Any) -> str:
         inp = content.get("input", {})
         uses.append(
             json.dumps(
-                {"tool": name, "parameters": inp},
+                {"tool": name, "parameters": inp, "id": content.get("id", "")},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -1245,7 +1186,20 @@ def _compile_tool_uses_for_model(content: Any) -> str:
 
 
 def _tool_continuation_prompt(req: AntRequest) -> str:
+    """Build the continuation prompt for turn 2+ of a tool loop.
+
+    MUST prepend the formatter protocol so the model stays in formatter mode
+    across turns. Without it, claude.ai reverts to conversational persona on
+    the second request.
+    """
     parts: list[str] = []
+
+    # Re-inject the formatter protocol so the model stays in tool-call mode.
+    if req.tools:
+        protocol = _build_model_tool_protocol(req.tools)
+        if protocol:
+            parts.append(protocol)
+
     for message in req.messages:
         tool_uses = _compile_tool_uses_for_model(message.content)
         if tool_uses:
@@ -1253,7 +1207,9 @@ def _tool_continuation_prompt(req: AntRequest) -> str:
 
         results = extract_tool_results(message.content)
         if results:
-            parts.append("Human: " + compile_tool_results_for_model(results))
+            rendered = []
+            rendered = compile_tool_results_for_model(results)
+            parts.append("Human: " + rendered)
             continue
 
         text = _ant_extract_text(message.content).strip()
@@ -1284,7 +1240,8 @@ def _ant_build_prompt(req: AntRequest) -> str:
                 system_text = _ant_extract_text(m.content).strip()
                 break
 
-    if system_text:
+    # AFTER
+    if system_text and not req.tools:
         parts.append(f"# SYSTEM CONTEXT\n\n{system_text}")
 
     # PRIORITY 3: Conversation history
@@ -1523,6 +1480,58 @@ def _ant_error_event(message: str, err_type: str = "server_error") -> str:
     )
 
 
+def _extract_json_tool_calls(text: str) -> list:
+    """Parse {"tool":"Name","parameters":{...}} JSON lines from model output.
+
+    Scans the text with a rolling cursor so duplicate or identical calls get
+    correct offsets (text.find() always returns the first occurrence).
+
+    Accepts both compact and space-padded JSON as emitted by the model.
+    """
+    from agent_bridge.tool_parser import ParsedToolCall
+    calls = []
+    cursor = 0
+    lines = text.splitlines(keepends=True)  # keep newlines to track cursor position
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        # Match lines that are a JSON object beginning with "tool" key.
+        # Handle both {"tool": (spaced) and {"tool": (compact).
+        if not (stripped.startswith('{"tool":') or stripped.startswith('{"tool" :')):
+            cursor += len(raw_line)
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            cursor += len(raw_line)
+            continue
+        name = obj.get("tool", "").strip()
+        params = obj.get("parameters", {})
+        if not name or not isinstance(params, dict):
+            cursor += len(raw_line)
+            continue
+        # Find where this stripped line sits within text starting from cursor.
+        offset_in_remaining = text.find(stripped, cursor)
+        if offset_in_remaining == -1:
+            # Fallback: shouldn't happen, but don't lose the call.
+            offset_in_remaining = cursor
+        start = offset_in_remaining
+        end = start + len(stripped)
+        print(
+            f"[tool-parse] found tool={name!r} params={list(params.keys())} "
+            f"offset={start}..{end}",
+            flush=True,
+        )
+        calls.append(ParsedToolCall(
+            name=name,
+            input=params,
+            raw=stripped,
+            start=start,
+            end=end,
+        ))
+        cursor += len(raw_line)
+    return calls
+
+
 @app.post("/v1/messages")
 async def ant_messages(request: Request, _=Depends(require_auth)):
     """
@@ -1576,6 +1585,12 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
 
     # Build the Claude web-API prompt
     prompt = _ant_build_prompt(req)
+
+    if os.getenv("CAPTURE_UPSTREAM_REQUEST", "0") == "1":
+        print(
+            "UPSTREAM_PROMPT_B64=" + base64.b64encode(prompt.encode()).decode(),
+            flush=True,
+        )
 
     last_user = next(
         (_ant_extract_text(m.content) for m in reversed(req.messages) if m.role == "user"),
@@ -1646,6 +1661,12 @@ async def ant_messages(request: Request, _=Depends(require_auth)):
                     event.text or ""
                     for event in events
                     if event.type == "content_block_delta" and event.delta_type == "text_delta"
+                )
+
+                print(
+                    f"[agent-loop] turn={session.turns} session={session_id[:16]} "
+                    f"model_output={repr(text[:200])}",
+                    flush=True,
                 )
 
                 parsed_calls = extract_tool_calls(text)

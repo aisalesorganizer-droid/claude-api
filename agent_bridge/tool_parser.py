@@ -55,9 +55,9 @@ def _decode_json_block(payload: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ToolCallParseError("JSON block must be a JSON object")
 
-    name = value.get("action") or value.get("name")
+    name = value.get("action") or value.get("name") or value.get("tool")
     if not isinstance(name, str) or not name.strip():
-        raise ToolCallParseError("JSON block requires a non-empty string 'action' or 'name'")
+        raise ToolCallParseError("JSON block requires a non-empty string 'action', 'name', or 'tool'")  # noqa: E501
 
     input_data = value.get("parameters") or value.get("input") or value.get("args", {})
     if not isinstance(input_data, dict):
